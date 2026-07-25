@@ -14,11 +14,11 @@ import 'package:kls_gps_tracker/kls_gps_tracker.dart';
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
-  testWidgets('getPlatformVersion test', (WidgetTester tester) async {
-    final KlsGpsTracker plugin = KlsGpsTracker();
-    final String? version = await plugin.getPlatformVersion();
-    // The version string depends on the host platform running the test, so
-    // just assert that some non-empty string is returned.
-    expect(version?.isNotEmpty, true);
+  testWidgets('checkReadiness returns a native GPS state', (
+    WidgetTester tester,
+  ) async {
+    final plugin = KlsGpsTracker();
+    final readiness = await plugin.checkReadiness();
+    expect(KlsLocationPermission.values, contains(readiness.permission));
   });
 }

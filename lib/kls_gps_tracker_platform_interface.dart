@@ -1,6 +1,7 @@
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'kls_gps_tracker_method_channel.dart';
+import 'src/gps_models.dart';
 
 abstract class KlsGpsTrackerPlatform extends PlatformInterface {
   /// Constructs a KlsGpsTrackerPlatform.
@@ -23,7 +24,13 @@ abstract class KlsGpsTrackerPlatform extends PlatformInterface {
     _instance = instance;
   }
 
-  Future<String?> getPlatformVersion() {
-    throw UnimplementedError('platformVersion() has not been implemented.');
-  }
+  Future<KlsLocationPermission> requestPermission();
+
+  Future<KlsGpsReadiness> checkReadiness();
+
+  Future<void> start();
+
+  Future<void> stop();
+
+  Stream<KlsGpsPoint> get positionStream;
 }
