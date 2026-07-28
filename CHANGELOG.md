@@ -4,6 +4,7 @@
 * Added location-service readiness checks.
 * Added a raw GPS position stream and start/stop lifecycle.
 * Added the GPS diagnostics example screen.
+* Added a FlutterFlow-compatible Android Gradle configuration.
 
 ## 0.0.1
 
