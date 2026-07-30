@@ -133,6 +133,9 @@ public final class KlsGpsTrackerPlugin: NSObject, FlutterPlugin, FlutterStreamHa
 
   public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
     guard let location = locations.last else { return }
+    guard location.horizontalAccuracy > 0, location.horizontalAccuracy <= 100 else { return }
+    guard abs(location.timestamp.timeIntervalSinceNow) <= 15 else { return }
+
     var point: [String: Any] = [
       "latitude": location.coordinate.latitude,
       "longitude": location.coordinate.longitude,

@@ -1,6 +1,7 @@
 import 'kls_gps_tracker_platform_interface.dart';
 import 'src/gps_models.dart';
 
+export 'src/gps_filter.dart';
 export 'src/gps_models.dart';
 
 class KlsGpsTracker {

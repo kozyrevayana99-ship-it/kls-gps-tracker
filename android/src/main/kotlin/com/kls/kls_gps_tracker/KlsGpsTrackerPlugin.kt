@@ -109,7 +109,11 @@ class KlsGpsTrackerPlugin :
         }
 
         try {
-            if (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            val useGps =
+                permissionStatus() == "precise" &&
+                    locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+
+            if (useGps) {
                 locationManager.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
                     UPDATE_INTERVAL_MILLIS,
@@ -117,7 +121,10 @@ class KlsGpsTrackerPlugin :
                     this,
                 )
             }
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+
+            // Do not mix GPS and cell/network fixes during a precise workout:
+            // alternating providers is a common source of large false jumps.
+            if (!useGps && locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
                 locationManager.requestLocationUpdates(
                     LocationManager.NETWORK_PROVIDER,
                     UPDATE_INTERVAL_MILLIS,
@@ -181,6 +188,8 @@ class KlsGpsTrackerPlugin :
             locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
 
     override fun onLocationChanged(location: Location) {
+        if (location.accuracy <= 0f || location.accuracy > 100f) return
+
         val point =
             mutableMapOf<String, Any>(
                 "latitude" to location.latitude,

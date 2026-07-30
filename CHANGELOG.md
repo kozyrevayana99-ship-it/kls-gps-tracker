@@ -1,3 +1,11 @@
+## 0.2.0
+
+* Added a reusable workout GPS quality filter with warm-up lock.
+* Added stationary-drift, poor-accuracy, timestamp, and impossible-jump checks.
+* Added median smoothing for current speed.
+* Android no longer mixes GPS and network-provider points during precise tracking.
+* Added `flutter_map` for the FlutterFlow real-map workout widget.
+
 ## 0.1.0
 
 * Added foreground location permission handling on Android and iOS.
