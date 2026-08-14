@@ -77,6 +77,7 @@ class KlsOfflineWorkout {
     required this.serverCreated,
     required this.serverFinished,
     required this.feedback,
+    required this.diaryData,
     this.pausedAtUtc,
     this.finishedAtUtc,
     this.durationSeconds = 0,
@@ -109,6 +110,9 @@ class KlsOfflineWorkout {
   final bool serverCreated;
   final bool serverFinished;
   final Map<String, dynamic> feedback;
+  /// Extra diary fields captured by the host app (heart rate, plan linkage,
+  /// laps, elevation and other UI-specific metadata).
+  final Map<String, dynamic> diaryData;
   final Map<String, dynamic>? serverResult;
   final String? lastError;
 
@@ -148,6 +152,7 @@ class KlsOfflineWorkout {
     'serverCreated': serverCreated,
     'serverFinished': serverFinished,
     'feedback': feedback,
+    'diaryData': diaryData,
     'serverResult': serverResult,
     'lastError': lastError,
   };
@@ -193,6 +198,9 @@ class KlsOfflineWorkout {
       serverCreated: json['serverCreated'] == true,
       serverFinished: json['serverFinished'] == true,
       feedback: Map<String, dynamic>.from(json['feedback'] as Map? ?? const {}),
+      diaryData: Map<String, dynamic>.from(
+        json['diaryData'] as Map? ?? const {},
+      ),
       serverResult: json['serverResult'] is Map
           ? Map<String, dynamic>.from(json['serverResult'] as Map)
           : null,
@@ -336,6 +344,7 @@ class KlsOfflineWorkoutManager {
     required bool usesGps,
     required bool isInterval,
     required KlsWorkoutEndpoints endpoints,
+    Map<String, dynamic> diaryData = const <String, dynamic>{},
     DateTime? startedAt,
   }) async {
     final cleanUserId = userId.trim();
@@ -360,6 +369,7 @@ class KlsOfflineWorkoutManager {
       serverCreated: false,
       serverFinished: false,
       feedback: _defaultFeedback,
+      diaryData: Map<String, dynamic>.from(diaryData),
     );
     await _store.put(workout);
     return workout;
@@ -434,6 +444,20 @@ class KlsOfflineWorkoutManager {
         'comment': comment.trim(),
       });
     await _store.patch(workoutId, <String, dynamic>{'feedback': feedback});
+  }
+
+  /// Stores host-app diary fields before synchronization. This lets a rich
+  /// FlutterFlow recorder keep its heart-rate, plan and lap metadata while the
+  /// network work is deferred.
+  Future<void> updateDiaryData({
+    required String workoutId,
+    required Map<String, dynamic> diaryData,
+  }) async {
+    final workout = await _store.get(workoutId);
+    if (workout == null) throw StateError('Local workout not found');
+    final merged = Map<String, dynamic>.from(workout.diaryData)
+      ..addAll(diaryData);
+    await _store.patch(workoutId, <String, dynamic>{'diaryData': merged});
   }
 
   Future<void> cancelWorkout(String workoutId) async {
@@ -640,7 +664,7 @@ class KlsOfflineWorkoutManager {
       finishResult['duration_seconds'],
       workout.durationSeconds,
     );
-    return <String, dynamic>{
+    final payload = <String, dynamic>{
       'training_id': workout.workoutId,
       'user_id': workout.userId,
       'date': workout.localDate,
@@ -650,8 +674,6 @@ class KlsOfflineWorkoutManager {
       'training_type': workout.diaryType,
       'duration_minutes': max(1, (duration / 60).round()),
       'distance_km': _asDouble(finishResult['distance_km']),
-      'avg_pulse': 0,
-      'max_pulse': 0,
       'wellbeing': _asInt(feedback['wellbeing'], 4),
       'comment': feedback['comment']?.toString() ?? '',
       'rpe': _asInt(feedback['rpe'], 5),
@@ -666,6 +688,20 @@ class KlsOfflineWorkoutManager {
       'finished_at_utc': workout.finishedAtUtc?.toIso8601String(),
       'is_interval': workout.isInterval,
     };
+    payload.addAll(workout.diaryData);
+
+    // Identity and server-calculated workout totals remain authoritative.
+    payload['training_id'] = workout.workoutId;
+    payload['gps_workout_id'] = workout.workoutId;
+    payload['user_id'] = workout.userId;
+    payload['duration_minutes'] = max(1, (duration / 60).round());
+    payload['distance_km'] = _asDouble(
+      finishResult['distance_km'],
+      _asDouble(payload['distance_km']),
+    );
+    payload['started_at_utc'] = workout.startedAtUtc.toIso8601String();
+    payload['finished_at_utc'] = workout.finishedAtUtc?.toIso8601String();
+    return payload;
   }
 
   static const Map<String, dynamic> _defaultFeedback = <String, dynamic>{
