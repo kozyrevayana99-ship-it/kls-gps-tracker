@@ -45,11 +45,11 @@ class KlsGpsFilter {
     this.stationarySpeedMetersPerSecond = 0.8,
     this.maxSpeedMetersPerSecond = 20,
     this.maximumGapSeconds = 15,
-  })  : assert(startupAccuracyMeters > 0),
-        assert(maxAccuracyMeters >= startupAccuracyMeters),
-        assert(warmupPointCount >= 1),
-        assert(minimumMovementMeters >= 0),
-        assert(maxSpeedMetersPerSecond > 0);
+  }) : assert(startupAccuracyMeters > 0),
+       assert(maxAccuracyMeters >= startupAccuracyMeters),
+       assert(warmupPointCount >= 1),
+       assert(minimumMovementMeters >= 0),
+       assert(maxSpeedMetersPerSecond > 0);
 
   final double startupAccuracyMeters;
   final double maxAccuracyMeters;
@@ -148,8 +148,8 @@ class KlsGpsFilter {
     }
 
     _lastAcceptedPoint = point;
-    final speed = reportedSpeed != null &&
-            reportedSpeed >= stationarySpeedMetersPerSecond
+    final speed =
+        reportedSpeed != null && reportedSpeed >= stationarySpeedMetersPerSecond
         ? reportedSpeed
         : derivedSpeed;
     return _accepted(point, segmentMeters: segment, speed: speed);
@@ -173,7 +173,8 @@ class KlsGpsFilter {
       final segment = _distanceMeters(previous, point);
       final derivedSpeed = segment / dt;
       final reportedSpeed = _reportedSpeed(point);
-      final looksLikeStationaryJump = reportedSpeed != null &&
+      final looksLikeStationaryJump =
+          reportedSpeed != null &&
           reportedSpeed < stationarySpeedMetersPerSecond &&
           derivedSpeed > 3;
 
@@ -224,10 +225,7 @@ class KlsGpsFilter {
     );
   }
 
-  KlsGpsFilterResult _result(
-    KlsGpsPointDecision decision,
-    KlsGpsPoint point,
-  ) {
+  KlsGpsFilterResult _result(KlsGpsPointDecision decision, KlsGpsPoint point) {
     return KlsGpsFilterResult(
       decision: decision,
       point: point,
@@ -262,7 +260,8 @@ class KlsGpsFilter {
     final phi2 = b.latitude * pi / 180;
     final dPhi = (b.latitude - a.latitude) * pi / 180;
     final dLambda = (b.longitude - a.longitude) * pi / 180;
-    final h = sin(dPhi / 2) * sin(dPhi / 2) +
+    final h =
+        sin(dPhi / 2) * sin(dPhi / 2) +
         cos(phi1) * cos(phi2) * sin(dLambda / 2) * sin(dLambda / 2);
     return radius * 2 * atan2(sqrt(h), sqrt(max(0, 1 - h)));
   }

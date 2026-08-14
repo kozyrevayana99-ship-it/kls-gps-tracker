@@ -39,10 +39,72 @@ class MethodChannelKlsGpsTracker extends KlsGpsTrackerPlatform {
   }
 
   @override
-  Future<void> start() => methodChannel.invokeMethod<void>('start');
+  Future<String> start({String? workoutId}) async {
+    final value = await methodChannel.invokeMethod<String>(
+      'start',
+      <String, Object?>{'workoutId': workoutId},
+    );
+    if (value == null || value.isEmpty) {
+      throw PlatformException(
+        code: 'invalid_workout_id',
+        message: 'Native GPS start did not return a workout id.',
+      );
+    }
+    return value;
+  }
 
   @override
-  Future<void> stop() => methodChannel.invokeMethod<void>('stop');
+  Future<void> stop({bool finishWorkout = true}) =>
+      methodChannel.invokeMethod<void>('stop', <String, Object?>{
+        'finishWorkout': finishWorkout,
+      });
+
+  @override
+  Future<KlsGpsTrackingState> getTrackingState() async {
+    final value = await methodChannel.invokeMapMethod<Object?, Object?>(
+      'getTrackingState',
+    );
+    if (value == null) {
+      throw PlatformException(
+        code: 'invalid_tracking_state',
+        message: 'Native GPS tracking state was empty.',
+      );
+    }
+    return KlsGpsTrackingState.fromMap(value);
+  }
+
+  @override
+  Future<List<KlsGpsPoint>> getStoredPoints({
+    required String workoutId,
+    int afterPointIndex = -1,
+    int limit = 1000,
+  }) async {
+    final value = await methodChannel
+        .invokeListMethod<Object?>('getStoredPoints', <String, Object?>{
+          'workoutId': workoutId,
+          'afterPointIndex': afterPointIndex,
+          'limit': limit.clamp(1, 5000),
+        });
+    return (value ?? const <Object?>[])
+        .map((item) => KlsGpsPoint.fromMap(item as Map<Object?, Object?>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<List<String>> listStoredWorkoutIds() async {
+    final value = await methodChannel.invokeListMethod<String>(
+      'listStoredWorkoutIds',
+    );
+    return List<String>.unmodifiable(value ?? const <String>[]);
+  }
+
+  @override
+  Future<void> deleteStoredWorkout(String workoutId) {
+    return methodChannel.invokeMethod<void>(
+      'deleteStoredWorkout',
+      <String, Object?>{'workoutId': workoutId},
+    );
+  }
 
   @override
   Stream<KlsGpsPoint> get positionStream {

@@ -28,9 +28,25 @@ abstract class KlsGpsTrackerPlatform extends PlatformInterface {
 
   Future<KlsGpsReadiness> checkReadiness();
 
-  Future<void> start();
+  Future<String> start({String? workoutId});
 
-  Future<void> stop();
+  /// Stops native location updates.
+  ///
+  /// When [finishWorkout] is false, the durable workout remains active and can
+  /// be resumed with the same id. This is used for a manual pause.
+  Future<void> stop({bool finishWorkout = true});
+
+  Future<KlsGpsTrackingState> getTrackingState();
+
+  Future<List<KlsGpsPoint>> getStoredPoints({
+    required String workoutId,
+    int afterPointIndex = -1,
+    int limit = 1000,
+  });
+
+  Future<List<String>> listStoredWorkoutIds();
+
+  Future<void> deleteStoredWorkout(String workoutId);
 
   Stream<KlsGpsPoint> get positionStream;
 }

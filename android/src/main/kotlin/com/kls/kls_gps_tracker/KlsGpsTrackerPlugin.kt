@@ -3,11 +3,9 @@ package com.kls.kls_gps_tracker
 import android.Manifest
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
-import android.location.Location
-import android.location.LocationListener
 import android.location.LocationManager
-import android.os.Bundle
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -23,40 +21,48 @@ class KlsGpsTrackerPlugin :
     MethodChannel.MethodCallHandler,
     EventChannel.StreamHandler,
     ActivityAware,
-    PluginRegistry.RequestPermissionsResultListener,
-    LocationListener {
+    PluginRegistry.RequestPermissionsResultListener {
 
     private lateinit var applicationContext: Context
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
     private lateinit var locationManager: LocationManager
+    private lateinit var storage: KlsGpsStorage
     private var activity: Activity? = null
     private var activityBinding: ActivityPluginBinding? = null
     private var eventSink: EventChannel.EventSink? = null
     private var permissionResult: MethodChannel.Result? = null
     private var hasRequestedPermission = false
-    private var isTracking = false
+
+    private val gpsListener: (Map<String, Any>) -> Unit = { point ->
+        eventSink?.success(point)
+    }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         applicationContext = binding.applicationContext
         locationManager =
             applicationContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        storage = KlsGpsStorage(applicationContext)
 
         methodChannel = MethodChannel(binding.binaryMessenger, METHOD_CHANNEL)
         eventChannel = EventChannel(binding.binaryMessenger, POSITION_CHANNEL)
         methodChannel.setMethodCallHandler(this)
         eventChannel.setStreamHandler(this)
+        KlsGpsEventBus.add(gpsListener)
+
+        resumeActiveWorkoutIfPossible()
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "requestPermission" -> requestPermission(result)
             "checkReadiness" -> result.success(readiness())
-            "start" -> startTracking(result)
-            "stop" -> {
-                stopTracking()
-                result.success(null)
-            }
+            "start" -> startTracking(call, result)
+            "stop" -> stopTracking(call, result)
+            "getTrackingState" -> result.success(trackingState())
+            "getStoredPoints" -> getStoredPoints(call, result)
+            "listStoredWorkoutIds" -> result.success(storage.listStoredWorkoutIds())
+            "deleteStoredWorkout" -> deleteStoredWorkout(call, result)
             else -> result.notImplemented()
         }
     }
@@ -94,7 +100,7 @@ class KlsGpsTrackerPlugin :
         )
     }
 
-    private fun startTracking(result: MethodChannel.Result) {
+    private fun startTracking(call: MethodCall, result: MethodChannel.Result) {
         if (!isLocationServiceEnabled()) {
             result.error("location_service_disabled", "Location services are disabled.", null)
             return
@@ -103,52 +109,98 @@ class KlsGpsTrackerPlugin :
             result.error("permission_denied", "Location permission has not been granted.", null)
             return
         }
-        if (isTracking) {
-            result.success(null)
+
+        val requestedWorkoutId = call.argument<String>("workoutId")
+        val workoutId = try {
+            storage.beginWorkout(requestedWorkoutId)
+        } catch (error: Exception) {
+            result.error("workout_already_active", error.message, null)
             return
         }
 
+        val intent = Intent(applicationContext, KlsGpsTrackingService::class.java).apply {
+            action = KlsGpsTrackingService.ACTION_START
+            putExtra(KlsGpsTrackingService.EXTRA_WORKOUT_ID, workoutId)
+        }
         try {
-            val useGps =
-                permissionStatus() == "precise" &&
-                    locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
-
-            if (useGps) {
-                locationManager.requestLocationUpdates(
-                    LocationManager.GPS_PROVIDER,
-                    UPDATE_INTERVAL_MILLIS,
-                    MIN_DISTANCE_METERS,
-                    this,
-                )
-            }
-
-            // Do not mix GPS and cell/network fixes during a precise workout:
-            // alternating providers is a common source of large false jumps.
-            if (!useGps && locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                locationManager.requestLocationUpdates(
-                    LocationManager.NETWORK_PROVIDER,
-                    UPDATE_INTERVAL_MILLIS,
-                    MIN_DISTANCE_METERS,
-                    this,
-                )
-            }
-            isTracking = true
-            result.success(null)
-        } catch (error: SecurityException) {
-            result.error("permission_denied", error.message, null)
+            ContextCompat.startForegroundService(applicationContext, intent)
+            result.success(workoutId)
+        } catch (error: Exception) {
+            storage.setTracking(false)
+            result.error("foreground_service_start_failed", error.message, null)
         }
     }
 
-    private fun stopTracking() {
-        if (!isTracking) return
-        locationManager.removeUpdates(this)
-        isTracking = false
+    private fun stopTracking(call: MethodCall, result: MethodChannel.Result) {
+        val finishWorkout = call.argument<Boolean>("finishWorkout") ?: true
+        if (finishWorkout) {
+            storage.finishWorkout(storage.activeWorkoutId())
+        } else {
+            storage.pauseWorkout()
+        }
+        val intent = Intent(applicationContext, KlsGpsTrackingService::class.java).apply {
+            action = KlsGpsTrackingService.ACTION_STOP
+            putExtra(KlsGpsTrackingService.EXTRA_FINISH_WORKOUT, finishWorkout)
+        }
+        applicationContext.startService(intent)
+        result.success(null)
+    }
+
+    private fun resumeActiveWorkoutIfPossible() {
+        val workoutId = storage.activeWorkoutId() ?: return
+        if (!storage.shouldAutoResume()) return
+        if (!hasLocationPermission() || !isLocationServiceEnabled()) return
+        val intent = Intent(applicationContext, KlsGpsTrackingService::class.java).apply {
+            action = KlsGpsTrackingService.ACTION_START
+            putExtra(KlsGpsTrackingService.EXTRA_WORKOUT_ID, workoutId)
+        }
+        runCatching { ContextCompat.startForegroundService(applicationContext, intent) }
+    }
+
+    private fun getStoredPoints(call: MethodCall, result: MethodChannel.Result) {
+        val workoutId = call.argument<String>("workoutId")?.trim().orEmpty()
+        if (workoutId.isEmpty()) {
+            result.error("invalid_workout_id", "workoutId is required.", null)
+            return
+        }
+        val afterPointIndex = call.argument<Number>("afterPointIndex")?.toInt() ?: -1
+        val limit = (call.argument<Number>("limit")?.toInt() ?: 1000).coerceIn(1, 5000)
+        try {
+            result.success(storage.readPoints(workoutId, afterPointIndex, limit))
+        } catch (error: Exception) {
+            result.error("storage_error", error.message, null)
+        }
+    }
+
+    private fun deleteStoredWorkout(call: MethodCall, result: MethodChannel.Result) {
+        val workoutId = call.argument<String>("workoutId")?.trim().orEmpty()
+        if (workoutId.isEmpty()) {
+            result.error("invalid_workout_id", "workoutId is required.", null)
+            return
+        }
+        try {
+            storage.deleteWorkout(workoutId)
+            result.success(null)
+        } catch (error: Exception) {
+            result.error("storage_error", error.message, null)
+        }
+    }
+
+    private fun trackingState(): Map<String, Any?> {
+        val workoutId = storage.activeWorkoutId()
+        return mapOf(
+            "isTracking" to storage.isTracking(),
+            "workoutId" to workoutId,
+            "pointCount" to if (workoutId == null) 0 else storage.pointCount(workoutId),
+            "backgroundCapable" to true,
+        )
     }
 
     private fun readiness(): Map<String, Any> =
         mapOf(
             "permission" to permissionStatus(),
             "serviceEnabled" to isLocationServiceEnabled(),
+            "backgroundCapable" to true,
         )
 
     private fun permissionStatus(): String {
@@ -187,29 +239,6 @@ class KlsGpsTrackerPlugin :
         locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
             locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
 
-    override fun onLocationChanged(location: Location) {
-        if (location.accuracy <= 0f || location.accuracy > 100f) return
-
-        val point =
-            mutableMapOf<String, Any>(
-                "latitude" to location.latitude,
-                "longitude" to location.longitude,
-                "accuracy" to location.accuracy.toDouble(),
-                "altitude" to location.altitude,
-                "timestampMillis" to location.time,
-            )
-        if (location.hasSpeed()) point["speed"] = location.speed.toDouble()
-        if (location.hasBearing()) point["heading"] = location.bearing.toDouble()
-        eventSink?.success(point)
-    }
-
-    @Deprecated("Deprecated in Android")
-    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
-
-    override fun onProviderEnabled(provider: String) = Unit
-
-    override fun onProviderDisabled(provider: String) = Unit
-
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         eventSink = events
     }
@@ -233,6 +262,7 @@ class KlsGpsTrackerPlugin :
         activityBinding = binding
         activity = binding.activity
         binding.addRequestPermissionsResultListener(this)
+        resumeActiveWorkoutIfPossible()
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
@@ -252,17 +282,17 @@ class KlsGpsTrackerPlugin :
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        stopTracking()
+        KlsGpsEventBus.remove(gpsListener)
         methodChannel.setMethodCallHandler(null)
         eventChannel.setStreamHandler(null)
         eventSink = null
+        // Deliberately do not stop KlsGpsTrackingService here. The workout must
+        // continue when the Flutter Activity or engine is detached.
     }
 
     private companion object {
         const val METHOD_CHANNEL = "kls_gps_tracker"
         const val POSITION_CHANNEL = "kls_gps_tracker/positions"
         const val LOCATION_PERMISSION_REQUEST = 8417
-        const val UPDATE_INTERVAL_MILLIS = 1000L
-        const val MIN_DISTANCE_METERS = 1f
     }
 }

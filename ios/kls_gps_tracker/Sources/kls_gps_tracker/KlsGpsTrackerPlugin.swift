@@ -6,6 +6,7 @@ public final class KlsGpsTrackerPlugin: NSObject, FlutterPlugin, FlutterStreamHa
   CLLocationManagerDelegate
 {
   private let locationManager = CLLocationManager()
+  private let storage = KlsGpsStorage()
   private var eventSink: FlutterEventSink?
   private var permissionResult: FlutterResult?
 
@@ -30,6 +31,7 @@ public final class KlsGpsTrackerPlugin: NSObject, FlutterPlugin, FlutterStreamHa
     )
     registrar.addMethodCallDelegate(instance, channel: methodChannel)
     eventChannel.setStreamHandler(instance)
+    instance.resumeActiveWorkoutIfPossible()
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -39,10 +41,17 @@ public final class KlsGpsTrackerPlugin: NSObject, FlutterPlugin, FlutterStreamHa
     case "checkReadiness":
       result(readiness())
     case "start":
-      start(result: result)
+      start(call: call, result: result)
     case "stop":
-      locationManager.stopUpdatingLocation()
-      result(nil)
+      stop(call: call, result: result)
+    case "getTrackingState":
+      result(trackingState())
+    case "getStoredPoints":
+      getStoredPoints(call: call, result: result)
+    case "listStoredWorkoutIds":
+      result(storage.listStoredWorkoutIds())
+    case "deleteStoredWorkout":
+      deleteStoredWorkout(call: call, result: result)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -68,7 +77,7 @@ public final class KlsGpsTrackerPlugin: NSObject, FlutterPlugin, FlutterStreamHa
     locationManager.requestWhenInUseAuthorization()
   }
 
-  private func start(result: @escaping FlutterResult) {
+  private func start(call: FlutterMethodCall, result: @escaping FlutterResult) {
     guard CLLocationManager.locationServicesEnabled() else {
       result(
         FlutterError(
@@ -90,15 +99,136 @@ public final class KlsGpsTrackerPlugin: NSObject, FlutterPlugin, FlutterStreamHa
       )
       return
     }
-    locationManager.startUpdatingLocation()
+
+    let arguments = call.arguments as? [String: Any]
+    let requestedWorkoutId = arguments?["workoutId"] as? String
+    do {
+      let workoutId = try storage.beginWorkout(requestedWorkoutId: requestedWorkoutId)
+      configureBackgroundUpdates()
+      storage.setTracking(true)
+      locationManager.startUpdatingLocation()
+      result(workoutId)
+    } catch {
+      result(
+        FlutterError(
+          code: "workout_already_active",
+          message: error.localizedDescription,
+          details: nil
+        )
+      )
+    }
+  }
+
+  private func stop(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let arguments = call.arguments as? [String: Any]
+    let finishWorkout = arguments?["finishWorkout"] as? Bool ?? true
+    locationManager.stopUpdatingLocation()
+    locationManager.allowsBackgroundLocationUpdates = false
+    if finishWorkout {
+      storage.finishWorkout(storage.activeWorkoutId)
+    } else {
+      storage.pauseWorkout()
+    }
     result(nil)
+  }
+
+  private func resumeActiveWorkoutIfPossible() {
+    guard storage.activeWorkoutId != nil else { return }
+    guard storage.shouldAutoResume else { return }
+    guard CLLocationManager.locationServicesEnabled() else { return }
+    let status = permissionStatus()
+    guard status == "precise" || status == "approximate" else { return }
+    configureBackgroundUpdates()
+    storage.setTracking(true)
+    locationManager.startUpdatingLocation()
+  }
+
+  private func configureBackgroundUpdates() {
+    let enabled = backgroundCapable()
+    locationManager.allowsBackgroundLocationUpdates = enabled
+    locationManager.showsBackgroundLocationIndicator = enabled
   }
 
   private func readiness() -> [String: Any] {
     [
       "permission": permissionStatus(),
       "serviceEnabled": CLLocationManager.locationServicesEnabled(),
+      "backgroundCapable": backgroundCapable(),
     ]
+  }
+
+  private func trackingState() -> [String: Any?] {
+    let workoutId = storage.activeWorkoutId
+    return [
+      "isTracking": storage.isTracking,
+      "workoutId": workoutId,
+      "pointCount": workoutId.map { storage.pointCount(workoutId: $0) } ?? 0,
+      "backgroundCapable": backgroundCapable(),
+    ]
+  }
+
+  private func getStoredPoints(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let arguments = call.arguments as? [String: Any]
+    guard let workoutId = arguments?["workoutId"] as? String, !workoutId.isEmpty else {
+      result(
+        FlutterError(
+          code: "invalid_workout_id",
+          message: "workoutId is required.",
+          details: nil
+        )
+      )
+      return
+    }
+    let afterPointIndex = (arguments?["afterPointIndex"] as? NSNumber)?.intValue ?? -1
+    let limit = (arguments?["limit"] as? NSNumber)?.intValue ?? 1000
+    do {
+      result(
+        try storage.readPoints(
+          workoutId: workoutId,
+          afterPointIndex: afterPointIndex,
+          limit: limit
+        )
+      )
+    } catch {
+      result(
+        FlutterError(
+          code: "storage_error",
+          message: error.localizedDescription,
+          details: nil
+        )
+      )
+    }
+  }
+
+  private func deleteStoredWorkout(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let arguments = call.arguments as? [String: Any]
+    guard let workoutId = arguments?["workoutId"] as? String, !workoutId.isEmpty else {
+      result(
+        FlutterError(
+          code: "invalid_workout_id",
+          message: "workoutId is required.",
+          details: nil
+        )
+      )
+      return
+    }
+    do {
+      try storage.deleteWorkout(workoutId)
+      result(nil)
+    } catch {
+      result(
+        FlutterError(
+          code: "storage_error",
+          message: error.localizedDescription,
+          details: nil
+        )
+      )
+    }
+  }
+
+  private func backgroundCapable() -> Bool {
+    let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
+    return modes?.contains("location") == true
   }
 
   private func permissionStatus() -> String {
@@ -124,32 +254,45 @@ public final class KlsGpsTrackerPlugin: NSObject, FlutterPlugin, FlutterStreamHa
     }
   }
 
+  @available(iOS 14.0, *)
   public func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+    completePermissionRequest(status: manager.authorizationStatus)
+  }
+
+  public func locationManager(
+    _ manager: CLLocationManager,
+    didChangeAuthorization status: CLAuthorizationStatus
+  ) {
+    completePermissionRequest(status: status)
+  }
+
+  private func completePermissionRequest(status: CLAuthorizationStatus) {
     guard let pendingResult = permissionResult else { return }
-    guard manager.authorizationStatus != .notDetermined else { return }
+    guard status != .notDetermined else { return }
     permissionResult = nil
     pendingResult(permissionStatus())
   }
 
   public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-    guard let location = locations.last else { return }
-    guard location.horizontalAccuracy > 0, location.horizontalAccuracy <= 100 else { return }
-    guard abs(location.timestamp.timeIntervalSinceNow) <= 15 else { return }
+    guard let workoutId = storage.activeWorkoutId else { return }
 
-    var point: [String: Any] = [
-      "latitude": location.coordinate.latitude,
-      "longitude": location.coordinate.longitude,
-      "accuracy": location.horizontalAccuracy,
-      "altitude": location.altitude,
-      "timestampMillis": location.timestamp.timeIntervalSince1970 * 1000,
-    ]
-    if location.speed >= 0 {
-      point["speed"] = location.speed
+    for location in locations {
+      guard CLLocationCoordinate2DIsValid(location.coordinate) else { continue }
+      do {
+        // The durable RAW journal is written before Flutter sees the fix. The
+        // Dart quality filter decides later whether it contributes to distance.
+        let point = try storage.append(location: location, workoutId: workoutId)
+        eventSink?(point)
+      } catch {
+        eventSink?(
+          FlutterError(
+            code: "storage_error",
+            message: error.localizedDescription,
+            details: nil
+          )
+        )
+      }
     }
-    if location.course >= 0 {
-      point["heading"] = location.course
-    }
-    eventSink?(point)
   }
 
   public func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {

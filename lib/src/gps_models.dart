@@ -12,10 +12,12 @@ class KlsGpsReadiness {
   const KlsGpsReadiness({
     required this.permission,
     required this.serviceStatus,
+    this.backgroundCapable = false,
   });
 
   final KlsLocationPermission permission;
   final KlsLocationServiceStatus serviceStatus;
+  final bool backgroundCapable;
 
   bool get canStart =>
       serviceStatus == KlsLocationServiceStatus.enabled &&
@@ -28,6 +30,33 @@ class KlsGpsReadiness {
       serviceStatus: map['serviceEnabled'] == true
           ? KlsLocationServiceStatus.enabled
           : KlsLocationServiceStatus.disabled,
+      backgroundCapable: map['backgroundCapable'] == true,
+    );
+  }
+}
+
+class KlsGpsTrackingState {
+  const KlsGpsTrackingState({
+    required this.isTracking,
+    required this.pointCount,
+    required this.backgroundCapable,
+    this.workoutId,
+  });
+
+  final bool isTracking;
+  final String? workoutId;
+  final int pointCount;
+  final bool backgroundCapable;
+
+  factory KlsGpsTrackingState.fromMap(Map<Object?, Object?> map) {
+    final rawWorkoutId = map['workoutId']?.toString();
+    return KlsGpsTrackingState(
+      isTracking: map['isTracking'] == true,
+      workoutId: rawWorkoutId == null || rawWorkoutId.isEmpty
+          ? null
+          : rawWorkoutId,
+      pointCount: (map['pointCount'] as num?)?.toInt() ?? 0,
+      backgroundCapable: map['backgroundCapable'] == true,
     );
   }
 }
@@ -41,6 +70,10 @@ class KlsGpsPoint {
     this.altitudeMeters,
     this.speedMetersPerSecond,
     this.headingDegrees,
+    this.pointIndex,
+    this.workoutId,
+    this.provider,
+    this.isMock = false,
   });
 
   final double latitude;
@@ -50,6 +83,10 @@ class KlsGpsPoint {
   final double? speedMetersPerSecond;
   final double? headingDegrees;
   final DateTime timestamp;
+  final int? pointIndex;
+  final String? workoutId;
+  final String? provider;
+  final bool isMock;
 
   factory KlsGpsPoint.fromMap(Map<Object?, Object?> map) {
     double? optionalDouble(String key) {
@@ -64,6 +101,10 @@ class KlsGpsPoint {
       altitudeMeters: optionalDouble('altitude'),
       speedMetersPerSecond: optionalDouble('speed'),
       headingDegrees: optionalDouble('heading'),
+      pointIndex: (map['pointIndex'] as num?)?.toInt(),
+      workoutId: map['workoutId']?.toString(),
+      provider: map['provider']?.toString(),
+      isMock: map['isMock'] == true,
       timestamp: DateTime.fromMillisecondsSinceEpoch(
         (map['timestampMillis'] as num).round(),
         isUtc: true,
