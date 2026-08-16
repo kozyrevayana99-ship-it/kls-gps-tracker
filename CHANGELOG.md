@@ -1,3 +1,12 @@
+## 0.4.1
+
+* Fixed valid running/ski movement being rejected when OS-reported speed temporarily stays near zero.
+* Kept RAW native GPS journaling separate from TRUSTED route/distance filtering.
+* Added lock-screen journal replay support in the FlutterFlow recorder.
+* Added GPS freshness watchdog and background-capability guard.
+* Added final partial automatic lap.
+* Updated live metrics: run pace; ski/rollerski speed + pace; bike speed + max speed.
+
 ## 0.2.0
 
 * Added a reusable workout GPS quality filter with warm-up lock.

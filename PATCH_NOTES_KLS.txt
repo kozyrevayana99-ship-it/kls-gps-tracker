@@ -1,0 +1,14 @@
+KLS GPS v0.4.1 patch
+
+Changed:
+- lib/src/gps_filter.dart
+- test/gps_filter_test.dart
+- flutterflow/KlsGpsWorkoutRecorderWidget.dart
+- pubspec.yaml version 0.4.1
+- CHANGELOG.md
+- example/ios/Runner/Info.plist (example only)
+
+Native iOS/Android storage and background service files were NOT rewritten because the uploaded v0.4.0 already contains durable RAW journals and Android foreground service / iOS conditional background updates.
+
+IMPORTANT for the real FlutterFlow app:
+Add UIBackgroundModes -> location to the app's ios/Runner/Info.plist via FlutterFlow Custom Code > Configuration Files. The plugin intentionally enables allowsBackgroundLocationUpdates only when this capability exists.

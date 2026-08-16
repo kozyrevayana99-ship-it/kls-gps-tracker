@@ -14,13 +14,12 @@ void main() {
       longitude: lng,
       accuracyMeters: accuracy,
       speedMetersPerSecond: speed,
-      timestamp: DateTime.utc(2026, 7, 30, 10, 0, second),
+      timestamp: DateTime.utc(2026, 8, 16, 10, 0, second),
     );
   }
 
-  test('locks only after consecutive stable points', () {
+  test('locks after consecutive accurate points', () {
     final filter = KlsGpsFilter();
-
     expect(
       filter.add(point(lat: 57, lng: 41, second: 0)).decision,
       KlsGpsPointDecision.warmingUp,
@@ -30,64 +29,83 @@ void main() {
       KlsGpsPointDecision.warmingUp,
     );
     final result = filter.add(point(lat: 57, lng: 41, second: 2));
-
     expect(result.shouldRecord, isTrue);
     expect(result.gpsLocked, isTrue);
-    expect(result.segmentMeters, 0);
   });
 
-  test('does not add stationary drift to distance', () {
+  test('does not add small stationary drift', () {
     final filter = KlsGpsFilter();
     filter.add(point(lat: 57, lng: 41, second: 0));
     filter.add(point(lat: 57, lng: 41, second: 1));
     filter.add(point(lat: 57, lng: 41, second: 2));
 
     final result = filter.add(
-      point(lat: 57.00003, lng: 41.00003, second: 3, speed: 0),
+      point(lat: 57.00001, lng: 41.00001, second: 3, speed: 0),
     );
 
+    expect(result.decision, KlsGpsPointDecision.stationary);
     expect(result.shouldRecord, isFalse);
-    expect(result.segmentMeters, 0);
   });
 
-  test('rejects a large stationary jump', () {
-    final filter = KlsGpsFilter(maxSpeedMetersPerSecond: 20);
-    filter.add(point(lat: 57, lng: 41, second: 0));
-    filter.add(point(lat: 57, lng: 41, second: 1));
-    filter.add(point(lat: 57, lng: 41, second: 2));
+  test('accepts real running even when OS speed temporarily reports zero', () {
+    final filter = KlsGpsFilter(maxSpeedMetersPerSecond: 12);
+    filter.add(point(lat: 57, lng: 41, second: 0, speed: 0));
+    filter.add(point(lat: 57, lng: 41, second: 1, speed: 0));
+    filter.add(point(lat: 57, lng: 41, second: 2, speed: 0));
+
+    // Roughly 4.4 m north in one second: a normal running speed.
+    final result = filter.add(
+      point(lat: 57.00004, lng: 41, second: 3, speed: 0),
+    );
+
+    expect(result.shouldRecord, isTrue);
+    expect(result.decision, KlsGpsPointDecision.accepted);
+    expect(result.segmentMeters, greaterThan(3));
+  });
+
+  test('slow movement accumulates instead of disappearing inside GPS noise', () {
+    final filter = KlsGpsFilter(maxSpeedMetersPerSecond: 12);
+    filter.add(point(lat: 57, lng: 41, second: 0, accuracy: 8, speed: 0));
+    filter.add(point(lat: 57, lng: 41, second: 1, accuracy: 8, speed: 0));
+    filter.add(point(lat: 57, lng: 41, second: 2, accuracy: 8, speed: 0));
+
+    final first = filter.add(
+      point(lat: 57.00001, lng: 41, second: 3, accuracy: 8, speed: 0),
+    );
+    expect(first.shouldRecord, isFalse);
+
+    final second = filter.add(
+      point(lat: 57.00004, lng: 41, second: 5, accuracy: 8, speed: 0),
+    );
+    expect(second.shouldRecord, isTrue);
+    expect(second.segmentMeters, greaterThan(3));
+  });
+
+  test('rejects an impossible 800 metre jump', () {
+    final filter = KlsGpsFilter(maxSpeedMetersPerSecond: 12);
+    filter.add(point(lat: 57, lng: 41, second: 0, speed: 2));
+    filter.add(point(lat: 57.00002, lng: 41, second: 1, speed: 2));
+    filter.add(point(lat: 57.00004, lng: 41, second: 2, speed: 2));
 
     final result = filter.add(
-      point(lat: 57.001, lng: 41, second: 6, speed: 0),
+      point(lat: 57.0072, lng: 41, second: 3, speed: 0),
     );
 
     expect(result.decision, KlsGpsPointDecision.rejectedJump);
     expect(result.shouldRecord, isFalse);
   });
 
-  test('accepts car-like 60 km/h for rollerski diagnostics', () {
-    final filter = KlsGpsFilter(maxSpeedMetersPerSecond: 20);
-    filter.add(point(lat: 57, lng: 41, second: 0, speed: 16.67));
-    filter.add(point(lat: 57.00015, lng: 41, second: 1, speed: 16.67));
-    filter.add(point(lat: 57.00030, lng: 41, second: 2, speed: 16.67));
+  test('gap reset adds no distance across a long missing interval', () {
+    final filter = KlsGpsFilter(maxSpeedMetersPerSecond: 12);
+    filter.add(point(lat: 57, lng: 41, second: 0, speed: 2));
+    filter.add(point(lat: 57.00002, lng: 41, second: 1, speed: 2));
+    filter.add(point(lat: 57.00004, lng: 41, second: 2, speed: 2));
 
     final result = filter.add(
-      point(lat: 57.00045, lng: 41, second: 3, speed: 16.67),
+      point(lat: 57.001, lng: 41, second: 30, speed: 2),
     );
 
-    expect(result.shouldRecord, isTrue);
-    expect(result.currentSpeedMetersPerSecond, closeTo(16.67, 0.01));
-  });
-
-  test('reset requires a new lock and forgets the old point', () {
-    final filter = KlsGpsFilter();
-    filter.add(point(lat: 57, lng: 41, second: 0));
-    filter.add(point(lat: 57, lng: 41, second: 1));
-    filter.add(point(lat: 57, lng: 41, second: 2));
-
-    filter.reset();
-    final result = filter.add(point(lat: 58, lng: 42, second: 3));
-
-    expect(result.decision, KlsGpsPointDecision.warmingUp);
-    expect(result.gpsLocked, isFalse);
+    expect(result.decision, KlsGpsPointDecision.gapReset);
+    expect(result.segmentMeters, 0);
   });
 }

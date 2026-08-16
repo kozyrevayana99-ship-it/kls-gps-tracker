@@ -33,9 +33,16 @@ class KlsGpsFilterResult {
 
 /// Stateful quality gate for workout GPS points.
 ///
-/// It waits for several consistent fixes, ignores low-quality coordinates,
-/// suppresses stationary drift, rejects impossible jumps, and smooths current
-/// speed. Call [reset] before every workout and after every pause.
+/// Important architecture rule:
+/// - native iOS/Android stores every RAW GPS fix first;
+/// - this filter only decides whether a fix is TRUSTED for route/distance;
+/// - a rejected point is never erased from the durable native journal.
+///
+/// The filter deliberately does NOT treat an OS-reported speed near zero as
+/// proof that the athlete is stationary. CLLocation/Android speed can lag for
+/// several fixes after starting, stopping, turning, or returning from the
+/// background. Movement is therefore decided primarily from coordinates,
+/// timestamps, accuracy, and a sport-specific physical speed ceiling.
 class KlsGpsFilter {
   KlsGpsFilter({
     this.startupAccuracyMeters = 20,
@@ -49,13 +56,18 @@ class KlsGpsFilter {
        assert(maxAccuracyMeters >= startupAccuracyMeters),
        assert(warmupPointCount >= 1),
        assert(minimumMovementMeters >= 0),
-       assert(maxSpeedMetersPerSecond > 0);
+       assert(maxSpeedMetersPerSecond > 0),
+       assert(maximumGapSeconds > 0);
 
   final double startupAccuracyMeters;
   final double maxAccuracyMeters;
   final int warmupPointCount;
   final double minimumMovementMeters;
+
+  /// Kept for API compatibility and for choosing a good live-speed source.
+  /// It is NOT used to reject real coordinate movement by itself.
   final double stationarySpeedMetersPerSecond;
+
   final double maxSpeedMetersPerSecond;
   final double maximumGapSeconds;
 
@@ -101,6 +113,9 @@ class KlsGpsFilter {
       return _result(KlsGpsPointDecision.rejectedTimestamp, point);
     }
 
+    // A long break means we cannot safely connect the two fixes. The new fix
+    // becomes an anchor for a new visual segment, but the gap itself adds zero
+    // distance.
     if (dt > maximumGapSeconds) {
       _lastAcceptedPoint = point;
       _speedWindow.clear();
@@ -113,46 +128,37 @@ class KlsGpsFilter {
     }
 
     final derivedSpeed = segment / dt;
-    final reportedSpeed = _reportedSpeed(point);
+    final speedAllowance = _speedAllowance(previous, point, dt);
 
-    // When the operating system reports that the device is stationary, a
-    // large coordinate displacement is drift, not real motion.
-    if (reportedSpeed != null &&
-        reportedSpeed < stationarySpeedMetersPerSecond) {
-      final driftRadius = max(
-        12.0,
-        previous.accuracyMeters + point.accuracyMeters,
-      );
-      if (segment <= driftRadius || derivedSpeed > 3) {
-        return _result(
-          derivedSpeed > 3
-              ? KlsGpsPointDecision.rejectedJump
-              : KlsGpsPointDecision.stationary,
-          point,
-        );
-      }
-    }
-
-    final speedAllowance = max(3.0, point.accuracyMeters / max(1.0, dt));
+    // Only a physically implausible coordinate displacement is a jump.
+    // OS-reported speed is intentionally NOT allowed to veto otherwise
+    // plausible coordinate movement.
     if (derivedSpeed > maxSpeedMetersPerSecond + speedAllowance) {
       return _result(KlsGpsPointDecision.rejectedJump, point);
     }
 
-    if (reportedSpeed != null &&
-        reportedSpeed > maxSpeedMetersPerSecond + speedAllowance) {
-      return _result(KlsGpsPointDecision.rejectedJump, point);
-    }
-
-    if (segment < minimumMovementMeters) {
+    // Suppress sub-accuracy drift without moving the accepted anchor. This is
+    // important: slow real movement accumulates against the same anchor until
+    // it leaves the GPS noise radius, so walking/running does not disappear.
+    final movementThreshold = max(
+      minimumMovementMeters,
+      _noiseRadius(previous, point),
+    );
+    if (segment < movementThreshold) {
       return _result(KlsGpsPointDecision.stationary, point);
     }
 
     _lastAcceptedPoint = point;
-    final speed =
-        reportedSpeed != null && reportedSpeed >= stationarySpeedMetersPerSecond
-        ? reportedSpeed
-        : derivedSpeed;
-    return _accepted(point, segmentMeters: segment, speed: speed);
+
+    return _accepted(
+      point,
+      segmentMeters: segment,
+      speed: _chooseLiveSpeed(
+        point: point,
+        derivedSpeed: derivedSpeed,
+        speedAllowance: speedAllowance,
+      ),
+    );
   }
 
   KlsGpsFilterResult _warmUp(KlsGpsPoint point) {
@@ -171,16 +177,15 @@ class KlsGpsFilter {
       }
 
       final segment = _distanceMeters(previous, point);
-      final derivedSpeed = segment / dt;
-      final reportedSpeed = _reportedSpeed(point);
-      final looksLikeStationaryJump =
-          reportedSpeed != null &&
-          reportedSpeed < stationarySpeedMetersPerSecond &&
-          derivedSpeed > 3;
+      if (!segment.isFinite) {
+        _warmupAccepted = 1;
+        _lastWarmupPoint = point;
+        return _result(KlsGpsPointDecision.rejectedInvalid, point);
+      }
 
-      if (!segment.isFinite ||
-          derivedSpeed > maxSpeedMetersPerSecond + 3 ||
-          looksLikeStationaryJump) {
+      final derivedSpeed = segment / dt;
+      final speedAllowance = _speedAllowance(previous, point, dt);
+      if (derivedSpeed > maxSpeedMetersPerSecond + speedAllowance) {
         _warmupAccepted = 1;
         _lastWarmupPoint = point;
         return _result(KlsGpsPointDecision.rejectedJump, point);
@@ -234,6 +239,50 @@ class KlsGpsFilter {
     );
   }
 
+  double _noiseRadius(KlsGpsPoint previous, KlsGpsPoint current) {
+    final accuracy = max(
+      max(0.0, previous.accuracyMeters),
+      max(0.0, current.accuracyMeters),
+    );
+
+    if (accuracy <= 0) return 2.0;
+    return (accuracy * 0.30).clamp(2.0, 10.0).toDouble();
+  }
+
+  double _speedAllowance(
+    KlsGpsPoint previous,
+    KlsGpsPoint current,
+    double dt,
+  ) {
+    final accuracy = max(
+      max(0.0, previous.accuracyMeters),
+      max(0.0, current.accuracyMeters),
+    );
+    return max(3.0, accuracy / max(1.0, dt));
+  }
+
+  double _chooseLiveSpeed({
+    required KlsGpsPoint point,
+    required double derivedSpeed,
+    required double speedAllowance,
+  }) {
+    final reported = _reportedSpeed(point);
+    if (reported == null || reported < stationarySpeedMetersPerSecond) {
+      return derivedSpeed;
+    }
+
+    if (reported > maxSpeedMetersPerSecond + speedAllowance) {
+      return derivedSpeed;
+    }
+
+    final allowedDifference = max(2.5, max(derivedSpeed, 1.0) * 0.75);
+    if ((reported - derivedSpeed).abs() > allowedDifference) {
+      return derivedSpeed;
+    }
+
+    return reported;
+  }
+
   bool _isCoordinateValid(KlsGpsPoint point) {
     return point.latitude.isFinite &&
         point.longitude.isFinite &&
@@ -263,7 +312,7 @@ class KlsGpsFilter {
     final h =
         sin(dPhi / 2) * sin(dPhi / 2) +
         cos(phi1) * cos(phi2) * sin(dLambda / 2) * sin(dLambda / 2);
-    return radius * 2 * atan2(sqrt(h), sqrt(max(0, 1 - h)));
+    return radius * 2 * atan2(sqrt(h), sqrt(max(0.0, 1.0 - h)));
   }
 
   double _median(List<double> values) {
