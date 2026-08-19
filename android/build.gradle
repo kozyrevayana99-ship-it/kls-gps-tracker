@@ -50,6 +50,11 @@ android {
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
+
+    // Нормальное определение местоположения Android:
+    // GPS + Wi-Fi + мобильная сеть + системные источники.
+    implementation 'com.google.android.gms:play-services-location:21.4.0'
+
     testImplementation 'org.jetbrains.kotlin:kotlin-test'
     testImplementation 'org.mockito:mockito-core:5.0.0'
 }
