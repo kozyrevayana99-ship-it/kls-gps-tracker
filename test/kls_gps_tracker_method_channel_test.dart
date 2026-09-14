@@ -21,7 +21,8 @@ void main() {
               'permission': 'precise',
               'serviceEnabled': true,
             },
-            'start' || 'stop' => null,
+            'start' => 'native-workout-id',
+            'stop' => null,
             _ => throw PlatformException(code: 'not_implemented'),
           };
         });
@@ -41,7 +42,7 @@ void main() {
   });
 
   test('sends start and stop methods', () async {
-    await platform.start();
+    expect(await platform.start(), 'native-workout-id');
     await platform.stop();
     expect(calls, containsAllInOrder(['start', 'stop']));
   });

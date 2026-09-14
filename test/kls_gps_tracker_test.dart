@@ -23,10 +23,35 @@ class MockKlsGpsTrackerPlatform
       KlsLocationPermission.precise;
 
   @override
-  Future<void> start() async => started = true;
+  Future<String> start({String? workoutId}) async {
+    started = true;
+    return workoutId ?? 'mock-workout-id';
+  }
 
   @override
-  Future<void> stop() async => started = false;
+  Future<void> stop({bool finishWorkout = true}) async => started = false;
+
+  @override
+  Future<KlsGpsTrackingState> getTrackingState() async =>
+      KlsGpsTrackingState(
+        isTracking: started,
+        workoutId: started ? 'mock-workout-id' : null,
+        pointCount: 0,
+        backgroundCapable: true,
+      );
+
+  @override
+  Future<List<KlsGpsPoint>> getStoredPoints({
+    required String workoutId,
+    int afterPointIndex = -1,
+    int limit = 1000,
+  }) async => const <KlsGpsPoint>[];
+
+  @override
+  Future<List<String>> listStoredWorkoutIds() async => const <String>[];
+
+  @override
+  Future<void> deleteStoredWorkout(String workoutId) async {}
 }
 
 void main() {
@@ -44,7 +69,7 @@ void main() {
     expect((await tracker.checkReadiness()).canStart, isTrue);
     expect(await tracker.requestPermission(), KlsLocationPermission.precise);
 
-    await tracker.start();
+    expect(await tracker.start(), 'mock-workout-id');
     expect(fakePlatform.started, isTrue);
     await tracker.stop();
     expect(fakePlatform.started, isFalse);

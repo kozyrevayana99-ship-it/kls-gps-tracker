@@ -13,6 +13,7 @@ import android.location.Location
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
@@ -64,6 +65,8 @@ class KlsGpsTrackingService : Service() {
     private var stopRequested = false
 
     private var finishWorkoutOnStop = true
+
+    private var workoutWakeLock: PowerManager.WakeLock? = null
 
 
     // =========================================================================
@@ -171,11 +174,15 @@ class KlsGpsTrackingService : Service() {
             workoutId!!,
         )
 
+        acquireWorkoutWakeLock()
+
 
         if (!hasLocationPermission()) {
             storage.setTracking(
                 false,
             )
+
+            releaseWorkoutWakeLock()
 
             stopSelf()
 
@@ -198,6 +205,8 @@ class KlsGpsTrackingService : Service() {
             storage.setTracking(
                 false,
             )
+
+            releaseWorkoutWakeLock()
 
             stopSelf()
 
@@ -370,6 +379,8 @@ class KlsGpsTrackingService : Service() {
             )
         }
 
+        releaseWorkoutWakeLock()
+
 
         stopSelf()
     }
@@ -387,6 +398,8 @@ class KlsGpsTrackingService : Service() {
         storage.setTracking(
             false,
         )
+
+        releaseWorkoutWakeLock()
 
 
         if (!stopRequested) {
@@ -408,6 +421,37 @@ class KlsGpsTrackingService : Service() {
     override fun onBind(
         intent: Intent?,
     ): IBinder? = null
+
+    private fun acquireWorkoutWakeLock() {
+        val current = workoutWakeLock
+        if (current?.isHeld == true) {
+            return
+        }
+
+        val powerManager =
+            getSystemService(POWER_SERVICE) as PowerManager
+
+        workoutWakeLock =
+            powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "${packageName}:kls_workout_voice",
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+    }
+
+
+    private fun releaseWorkoutWakeLock() {
+        workoutWakeLock?.let { lock ->
+            if (lock.isHeld) {
+                runCatching {
+                    lock.release()
+                }
+            }
+        }
+        workoutWakeLock = null
+    }
 
 
     // =========================================================================

@@ -2,7 +2,7 @@
 
 KLS GPS diagnostics plugin for Flutter.
 
-Version `0.2.0` provides the native raw-location layer plus a reusable workout
+Version `0.4.3` provides the native raw-location layer plus a reusable workout
 quality filter:
 
 - foreground location permission requests;
@@ -14,6 +14,8 @@ quality filter:
 - poor-accuracy, stationary-drift, timestamp, and impossible-jump rejection;
 - median smoothing for current speed;
 - native Android LocationManager and Apple Core Location implementations.
+- an Android workout wake lock so Flutter timers and spoken workout cues keep
+  running while the screen is locked.
 
 The `flutterflow/KlsGpsWorkoutRecorderWidget.dart` file contains the full
 FlutterFlow widget with a real `flutter_map` OpenStreetMap map, route segments,
@@ -56,13 +58,24 @@ Add a clear purpose string to the host application's `Info.plist`:
 ```xml
 <key>NSLocationWhenInUseUsageDescription</key>
 <string>КЛС использует геопозицию для записи маршрута тренировки.</string>
+
+<key>UIBackgroundModes</key>
+<array>
+  <string>location</string>
+  <string>audio</string>
+</array>
 ```
+
+The `location` mode keeps the workout session active behind the lock screen.
+The `audio` mode lets the playback audio session used by workout voice prompts
+remain audible while the iPhone is locked.
 
 ## Android setup
 
-The plugin manifest contributes foreground coarse and fine location
-permissions. Background permission and a foreground service will be added in a
-later milestone.
+The plugin manifest contributes location and foreground-service permissions,
+the workout foreground service, the TTS-service visibility query, and a partial
+wake lock. The wake lock is held only while native workout recording is active
+and is released on pause, finish, or service teardown.
 
 ## Example
 

@@ -1,3 +1,10 @@
+## 0.4.3
+
+* Kept the Android workout process awake while the screen is locked so Flutter
+  timers and voice cues continue to run.
+* Added Android TTS service discovery.
+* Documented the iOS background audio mode required for lock-screen cues.
+
 ## 0.4.1
 
 * Fixed valid running/ski movement being rejected when OS-reported speed temporarily stays near zero.

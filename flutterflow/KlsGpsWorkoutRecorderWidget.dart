@@ -12,19 +12,22 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'dart:ui';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:http/http.dart' as http;
 import 'package:kls_gps_tracker/kls_gps_tracker.dart';
 import 'package:latlong2/latlong.dart' as ll;
 
-const _klsGold = Color(0xFFD6A85A);
-const _klsIce = Color(0xFF9ED8FF);
-const _klsNavy = Color(0xFF061326);
-const _klsGreen = Color(0xFF69E6A3);
-const _klsRed = Color(0xFFFF6B6B);
+const _klsGold = Color(0xFFE9C18A);
+const _klsIce = Color(0xFF6CA9E8);
+const _klsNavy = Color(0xFF061522);
+const _klsGreen = Color(0xFF3DD598);
+const _klsRed = Color(0xFFEC6A6A);
+const _klsHeartRateZonesUrl =
+    'https://functions.yandexcloud.net/d4emvlnnohqcaaocog8r';
 
 class KlsGpsWorkoutRecorderWidget extends StatefulWidget {
   const KlsGpsWorkoutRecorderWidget({
@@ -114,16 +117,69 @@ class _WorkoutLap {
   final bool isAutomatic;
 
   Map<String, dynamic> toJson() => {
-        'number': number,
-        'distance_meters': distanceMeters,
-        'duration_seconds': durationSeconds,
-        'elevation_gain_meters': elevationGainMeters,
-        'is_automatic': isAutomatic,
-      };
+    'number': number,
+    'distance_meters': distanceMeters,
+    'duration_seconds': durationSeconds,
+    'elevation_gain_meters': elevationGainMeters,
+    'is_automatic': isAutomatic,
+  };
+}
+
+class _HeartRateZones {
+  const _HeartRateZones({
+    required this.maxHeartRate,
+    required this.zoneMaxes,
+    required this.source,
+    required this.updatedAt,
+  });
+
+  final int maxHeartRate;
+  final List<int> zoneMaxes;
+  final String source;
+  final String? updatedAt;
+
+  List<Map<String, dynamic>> get ranges => <Map<String, dynamic>>[
+    {'zone': 1, 'min': null, 'max': zoneMaxes[0]},
+    for (var index = 1; index < 4; index++)
+      {
+        'zone': index + 1,
+        'min': zoneMaxes[index - 1] + 1,
+        'max': zoneMaxes[index],
+      },
+    {'zone': 5, 'min': zoneMaxes[3] + 1, 'max': maxHeartRate},
+  ];
+
+  Map<String, dynamic> toJson() => {
+    'personal_max_heart_rate': maxHeartRate,
+    'hr_zone1_max': zoneMaxes[0],
+    'hr_zone2_max': zoneMaxes[1],
+    'hr_zone3_max': zoneMaxes[2],
+    'hr_zone4_max': zoneMaxes[3],
+    'source': source,
+    'updated_at': updatedAt,
+    'zones': ranges,
+  };
+}
+
+class _IntervalStage {
+  const _IntervalStage({
+    required this.key,
+    required this.title,
+    required this.remainingSeconds,
+    required this.repeatNumber,
+    required this.finished,
+  });
+
+  final String key;
+  final String title;
+  final int remainingSeconds;
+  final int repeatNumber;
+  final bool finished;
 }
 
 class _KlsGpsWorkoutRecorderWidgetState
-    extends State<KlsGpsWorkoutRecorderWidget> with WidgetsBindingObserver {
+    extends State<KlsGpsWorkoutRecorderWidget>
+    with WidgetsBindingObserver {
   final List<_SportOption> _sports = const [
     _SportOption(
       key: 'ski',
@@ -159,14 +215,62 @@ class _KlsGpsWorkoutRecorderWidgetState
   final KlsOfflineWorkoutManager _offlineManager = KlsOfflineWorkoutManager();
   final MapController _mapController = MapController();
   final TextEditingController _commentController = TextEditingController();
+  final FlutterTts _tts = FlutterTts();
 
   StreamSubscription<KlsGpsPoint>? _positionSub;
-  StreamSubscription<int>? _heartRateSubscription;
+  StreamSubscription<Map<String, dynamic>>? _heartRateSubscription;
   Future<String>? _gpsStartFuture;
   Future<void>? _journalReplayFuture;
 
   Timer? _timer;
   Timer? _syncTimer;
+
+  int _setupStep = 0;
+  String _workoutMode = 'free';
+
+  bool _isLoadingHeartRateZones = false;
+  String? _heartRateZonesError;
+  _HeartRateZones? _profileHeartRateZones;
+  _HeartRateZones? _workoutHeartRateZones;
+
+  String _freeGoalType = 'none';
+  int _freeGoalMinutes = 60;
+  double _freeGoalDistanceKm = 10;
+  String _audioSummaryType = '10_min';
+  bool _voiceEnabled = true;
+  String? _lastSpokenIntervalStage;
+  String? _lastSpokenIntervalCountdown;
+  String? _lastSpokenTargetStatus;
+  bool _freeGoalCompletionSpoken = false;
+  int _lastSpokenFreeSummaryIndex = 0;
+
+  bool _intensityUsesManualRange = false;
+  int _intensityTargetZone = 2;
+  int _manualTargetMin = 135;
+  int _manualTargetMax = 150;
+
+  int _intervalWarmupMinutes = 15;
+  int _intervalWorkMinutes = 5;
+  int _intervalRecoveryMinutes = 3;
+  int _intervalRepeats = 6;
+  int _intervalCooldownMinutes = 10;
+  bool _intervalUsesHeartRate = false;
+  int _intervalTargetZone = 4;
+
+  final List<int> _heartRateZoneMilliseconds = List<int>.filled(5, 0);
+  int _heartRateCoveredMilliseconds = 0;
+  int _coachHeartRateSampleCount = 0;
+  int _coachHeartRateSum = 0;
+  int _coachHeartRateMax = 0;
+  DateTime? _lastCoachHeartRateAt;
+  int? _lastCoachHeartRateBpm;
+  int _belowTargetMilliseconds = 0;
+  int _insideTargetMilliseconds = 0;
+  int _aboveTargetMilliseconds = 0;
+  int _continuousBelowMilliseconds = 0;
+  int _continuousAboveMilliseconds = 0;
+  String _targetStatus = 'waiting';
+  int _lastPersistedCoachSecond = -1;
 
   KlsGpsFilter? _gpsFilter;
 
@@ -246,9 +350,9 @@ class _KlsGpsWorkoutRecorderWidgetState
   String? _finishedHeartRateDeviceName;
 
   _SportOption get _selectedSport => _sports.firstWhere(
-        (sport) => sport.key == _sportType,
-        orElse: () => _sports[2],
-      );
+    (sport) => sport.key == _sportType,
+    orElse: () => _sports[2],
+  );
 
   bool get _hasPlanContext =>
       (widget.planKey?.trim().isNotEmpty ?? false) &&
@@ -275,11 +379,11 @@ class _KlsGpsWorkoutRecorderWidgetState
       _backgroundGpsCapable;
 
   KlsWorkoutEndpoints get _endpoints => KlsWorkoutEndpoints(
-        startWorkoutUrl: widget.startWorkoutUrl?.trim() ?? '',
-        saveWorkoutBatchUrl: widget.saveWorkoutBatchUrl?.trim() ?? '',
-        finishWorkoutUrl: widget.finishWorkoutUrl?.trim() ?? '',
-        addTrainingUrl: widget.addTrainingUrl?.trim() ?? '',
-      );
+    startWorkoutUrl: widget.startWorkoutUrl?.trim() ?? '',
+    saveWorkoutBatchUrl: widget.saveWorkoutBatchUrl?.trim() ?? '',
+    finishWorkoutUrl: widget.finishWorkoutUrl?.trim() ?? '',
+    addTrainingUrl: widget.addTrainingUrl?.trim() ?? '',
+  );
 
   bool get _heartRateConnected => KlsHeartRateDeviceWidget.sensorConnected;
   int? get _currentHeartRateBpm => KlsHeartRateDeviceWidget.currentBpm;
@@ -289,15 +393,748 @@ class _KlsGpsWorkoutRecorderWidgetState
     return name.isEmpty ? 'Пульсометр' : name;
   }
 
-  List<_TrackPoint> get _allRoutePoints => _routeSegments
-      .expand((segment) => segment)
-      .toList(growable: false);
+  List<_TrackPoint> get _allRoutePoints =>
+      _routeSegments.expand((segment) => segment).toList(growable: false);
 
   List<_TrackPoint> get _activeSegment {
     if (_routeSegments.isEmpty) {
       _routeSegments.add(<_TrackPoint>[]);
     }
     return _routeSegments.last;
+  }
+
+  String get _workoutModeTitle {
+    switch (_workoutMode) {
+      case 'intensity':
+        return 'Контроль интенсивности';
+      case 'interval':
+        return 'Интервальная';
+      default:
+        return 'Свободная';
+    }
+  }
+
+  Future<void> _initializeVoice() async {
+    try {
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+        await _tts.setSharedInstance(true);
+        await _tts.setIosAudioCategory(
+          IosTextToSpeechAudioCategory.playback,
+          <IosTextToSpeechAudioCategoryOptions>[
+            IosTextToSpeechAudioCategoryOptions.mixWithOthers,
+            IosTextToSpeechAudioCategoryOptions.duckOthers,
+            IosTextToSpeechAudioCategoryOptions
+                .interruptSpokenAudioAndMixWithOthers,
+            IosTextToSpeechAudioCategoryOptions.allowBluetoothA2DP,
+            IosTextToSpeechAudioCategoryOptions.allowAirPlay,
+          ],
+          IosTextToSpeechAudioMode.voicePrompt,
+        );
+      } else if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+        await _tts.setAudioAttributesForNavigation();
+        await _tts.setQueueMode(0);
+      }
+
+      await _tts.setLanguage('ru-RU');
+      await _selectMostNaturalRussianVoice();
+      await _tts.setSpeechRate(0.48);
+      await _tts.setVolume(1.0);
+      await _tts.setPitch(0.98);
+      await _tts.awaitSpeakCompletion(false);
+    } catch (error) {
+      debugPrint('Не удалось подготовить голосовые подсказки: $error');
+    }
+  }
+
+  int _voiceQualityScore(Map<dynamic, dynamic> voice) {
+    final locale = voice['locale']?.toString().toLowerCase() ?? '';
+    if (locale != 'ru-ru' && !locale.startsWith('ru')) return -10000;
+
+    var score = locale == 'ru-ru' ? 200 : 100;
+    switch (voice['quality']?.toString().toLowerCase()) {
+      case 'premium':
+        score += 1000;
+        break;
+      case 'enhanced':
+        score += 850;
+        break;
+      case 'very high':
+        score += 750;
+        break;
+      case 'high':
+        score += 600;
+        break;
+      case 'normal':
+        score += 300;
+        break;
+      case 'low':
+        score += 100;
+        break;
+    }
+
+    final name = voice['name']?.toString().toLowerCase() ?? '';
+    if (name.contains('premium') ||
+        name.contains('enhanced') ||
+        name.contains('neural')) {
+      score += 100;
+    }
+    if (name.contains('compact')) score -= 150;
+
+    if (voice['network_required']?.toString() != '1') score += 20;
+    return score;
+  }
+
+  Future<void> _selectMostNaturalRussianVoice() async {
+    try {
+      final rawVoices = await _tts.getVoices;
+      if (rawVoices is! List) return;
+
+      final russianVoices = rawVoices
+          .whereType<Map>()
+          .where((voice) => _voiceQualityScore(voice) >= 0)
+          .toList();
+      if (russianVoices.isEmpty) return;
+
+      russianVoices.sort(
+        (left, right) =>
+            _voiceQualityScore(right).compareTo(_voiceQualityScore(left)),
+      );
+
+      final selected = russianVoices.first;
+      final voice = <String, String>{};
+      for (final key in <String>['identifier', 'name', 'locale']) {
+        final value = selected[key]?.toString().trim() ?? '';
+        if (value.isNotEmpty) voice[key] = value;
+      }
+
+      if (voice.isNotEmpty) {
+        await _tts.setVoice(voice);
+        debugPrint(
+          'Голосовые подсказки КЛС: '
+          '${voice['name'] ?? voice['identifier'] ?? 'ru-RU'} '
+          '(${selected['quality'] ?? 'system'})',
+        );
+      }
+    } catch (error) {
+      debugPrint('Не удалось выбрать улучшенный русский голос: $error');
+    }
+  }
+
+  String _spokenMinutes(int value) {
+    final mod100 = value.abs() % 100;
+    final mod10 = value.abs() % 10;
+    final word = mod100 >= 11 && mod100 <= 14
+        ? 'минут'
+        : mod10 == 1
+        ? 'минута'
+        : mod10 >= 2 && mod10 <= 4
+        ? 'минуты'
+        : 'минут';
+    return '$value $word';
+  }
+
+  String _spokenDistance(double kilometers) {
+    final rounded = kilometers.round();
+    if ((kilometers - rounded).abs() > 0.04) {
+      return '${kilometers.toStringAsFixed(1).replaceAll('.', ',')} километра';
+    }
+
+    final mod100 = rounded.abs() % 100;
+    final mod10 = rounded.abs() % 10;
+    final word = mod100 >= 11 && mod100 <= 14
+        ? 'километров'
+        : mod10 == 1
+        ? 'километр'
+        : mod10 >= 2 && mod10 <= 4
+        ? 'километра'
+        : 'километров';
+    return '$rounded $word';
+  }
+
+  Future<void> _speak(String text) async {
+    if (!_voiceEnabled || text.trim().isEmpty) return;
+    try {
+      await _tts.stop();
+      await _tts.speak(
+        text,
+        focus: !kIsWeb && defaultTargetPlatform == TargetPlatform.android,
+      );
+    } catch (error) {
+      debugPrint('Не удалось произнести подсказку: $error');
+    }
+  }
+
+  Future<void> _stopVoice() async {
+    try {
+      await _tts.stop();
+    } catch (_) {}
+  }
+
+  void _updateVoiceGuidance() {
+    if (!_isTracking || _isPaused || !_voiceEnabled) return;
+
+    if (_workoutMode == 'interval') {
+      final stage = _intervalStageAt(_elapsedSeconds);
+      final stageId = '${stage.key}:${stage.repeatNumber}';
+      if (_lastSpokenIntervalStage != stageId) {
+        _lastSpokenIntervalStage = stageId;
+        switch (stage.key) {
+          case 'warmup':
+            unawaited(
+              _speak(
+                'Начинаем разминку. '
+                '${_spokenMinutes(_intervalWarmupMinutes)}.',
+              ),
+            );
+            break;
+          case 'work':
+            unawaited(
+              _speak(
+                'Рабочий интервал ${stage.repeatNumber} из $_intervalRepeats. '
+                '${_spokenMinutes(_intervalWorkMinutes)}.',
+              ),
+            );
+            break;
+          case 'recovery':
+            unawaited(
+              _speak(
+                'Переходим к восстановлению. '
+                '${_spokenMinutes(_intervalRecoveryMinutes)}.',
+              ),
+            );
+            break;
+          case 'cooldown':
+            unawaited(
+              _speak(
+                'Начинаем заминку. '
+                '${_spokenMinutes(_intervalCooldownMinutes)}.',
+              ),
+            );
+            break;
+          case 'finished':
+            unawaited(_speak('Задание выполнено. Можно завершить тренировку.'));
+            break;
+        }
+      } else if (stage.remainingSeconds == 60 &&
+          !stage.finished &&
+          _lastSpokenIntervalCountdown != stageId) {
+        _lastSpokenIntervalCountdown = stageId;
+        unawaited(_speak('Осталась одна минута.'));
+      }
+      return;
+    }
+
+    if (_workoutMode == 'free' && !_freeGoalCompletionSpoken) {
+      final timeReached =
+          _freeGoalType == 'time' && _elapsedSeconds >= _freeGoalMinutes * 60;
+      final distanceReached =
+          _freeGoalType == 'distance' &&
+          _distanceMeters >= _freeGoalDistanceKm * 1000;
+      if (timeReached || distanceReached) {
+        _freeGoalCompletionSpoken = true;
+        unawaited(_speak('Цель тренировки выполнена.'));
+      }
+    }
+    if (_workoutMode == 'free' && _audioSummaryType != 'off') {
+      final summaryIndex = _audioSummaryType == '1_km'
+          ? (_distanceMeters / 1000).floor()
+          : _audioSummaryType == '5_km'
+          ? (_distanceMeters / 5000).floor()
+          : (_elapsedSeconds / 600).floor();
+      if (summaryIndex > 0 && summaryIndex > _lastSpokenFreeSummaryIndex) {
+        _lastSpokenFreeSummaryIndex = summaryIndex;
+        final minutes = max(1, (_elapsedSeconds / 60).round());
+        final kilometers = _distanceMeters / 1000;
+        final averageBpm = _coachHeartRateSampleCount > 0
+            ? (_coachHeartRateSum / _coachHeartRateSampleCount).round()
+            : null;
+        unawaited(
+          _speak(
+            '${_spokenMinutes(minutes)}. ${_spokenDistance(kilometers)}.'
+            '${averageBpm == null ? '' : ' Средний пульс — $averageBpm ударов в минуту.'}',
+          ),
+        );
+      }
+    }
+  }
+
+  void _announceTargetStatusIfNeeded(String previousStatus) {
+    if (!_voiceEnabled || !_isTracking || _isPaused) return;
+    if (_targetStatus == previousStatus) return;
+    if (_targetStatus == 'below' || _targetStatus == 'above') {
+      _lastSpokenTargetStatus = _targetStatus;
+      unawaited(HapticFeedback.heavyImpact());
+      unawaited(
+        _speak(
+          _targetStatus == 'below'
+              ? 'Пульс ниже цели. Можно немного добавить темп.'
+              : 'Пульс выше цели. Плавно снизьте темп.',
+        ),
+      );
+    } else if (_targetStatus == 'inside' &&
+        (_lastSpokenTargetStatus == 'below' ||
+            _lastSpokenTargetStatus == 'above')) {
+      _lastSpokenTargetStatus = 'inside';
+      unawaited(_speak('Хорошо. Вы снова в целевом диапазоне.'));
+    }
+  }
+
+  _HeartRateZones? _parseHeartRateZones(dynamic value) {
+    if (value is! Map || value['configured'] != true) return null;
+    final maximum = _asInt(value['personal_max_heart_rate']);
+    final maxes = <int>[
+      _asInt(value['hr_zone1_max']),
+      _asInt(value['hr_zone2_max']),
+      _asInt(value['hr_zone3_max']),
+      _asInt(value['hr_zone4_max']),
+    ];
+    if (maximum < 100 ||
+        maximum > 240 ||
+        maxes[0] < 40 ||
+        !(maxes[0] < maxes[1] &&
+            maxes[1] < maxes[2] &&
+            maxes[2] < maxes[3] &&
+            maxes[3] < maximum)) {
+      return null;
+    }
+    return _HeartRateZones(
+      maxHeartRate: maximum,
+      zoneMaxes: maxes,
+      source: value['source']?.toString() ?? 'manual',
+      updatedAt: value['updated_at']?.toString(),
+    );
+  }
+
+  Future<void> _loadHeartRateZones() async {
+    final userId = widget.currentUserId?.trim() ?? '';
+    if (userId.isEmpty || _isLoadingHeartRateZones) return;
+    if (mounted) {
+      setState(() {
+        _isLoadingHeartRateZones = true;
+        _heartRateZonesError = null;
+      });
+    }
+    try {
+      final baseUri = Uri.parse(_klsHeartRateZonesUrl);
+      final uri = baseUri.replace(
+        queryParameters: {...baseUri.queryParameters, 'user_id': userId},
+      );
+      final response = await http.get(uri).timeout(const Duration(seconds: 20));
+      final decoded = jsonDecode(response.body);
+      if (response.statusCode < 200 ||
+          response.statusCode >= 300 ||
+          decoded is! Map ||
+          decoded['success'] != true) {
+        throw Exception('Не удалось загрузить пульсовые зоны');
+      }
+      final zones = _parseHeartRateZones(decoded['heart_rate_zones']);
+      if (!mounted) return;
+      setState(() {
+        _profileHeartRateZones = zones;
+        if (zones == null) {
+          _heartRateZonesError = 'Пульсовые зоны пока не настроены';
+          _intensityUsesManualRange = true;
+        }
+      });
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _heartRateZonesError = _cleanError(error);
+          if (_profileHeartRateZones == null) {
+            _intensityUsesManualRange = true;
+          }
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _isLoadingHeartRateZones = false);
+    }
+  }
+
+  List<int>? _zoneBounds(int zone, [_HeartRateZones? zones]) {
+    final source = zones ?? _workoutHeartRateZones ?? _profileHeartRateZones;
+    if (source == null || zone < 1 || zone > 5) return null;
+    final lower = zone == 1 ? 25 : source.zoneMaxes[zone - 2] + 1;
+    final upper = zone == 5 ? source.maxHeartRate : source.zoneMaxes[zone - 1];
+    return <int>[lower, upper];
+  }
+
+  int? _zoneForBpm(int bpm) {
+    final zones = _workoutHeartRateZones;
+    if (zones == null || bpm < 25) return null;
+    for (var index = 0; index < zones.zoneMaxes.length; index++) {
+      if (bpm <= zones.zoneMaxes[index]) return index + 1;
+    }
+    return 5;
+  }
+
+  _IntervalStage _intervalStageAt(int elapsedSeconds) {
+    var remaining = max(0, elapsedSeconds);
+    final warmup = _intervalWarmupMinutes * 60;
+    final work = _intervalWorkMinutes * 60;
+    final recovery = _intervalRecoveryMinutes * 60;
+    final cooldown = _intervalCooldownMinutes * 60;
+
+    if (warmup > 0 && remaining < warmup) {
+      return _IntervalStage(
+        key: 'warmup',
+        title: 'Разминка',
+        remainingSeconds: warmup - remaining,
+        repeatNumber: 0,
+        finished: false,
+      );
+    }
+    remaining = max(0, remaining - warmup);
+
+    for (var repeat = 1; repeat <= _intervalRepeats; repeat++) {
+      if (remaining < work) {
+        return _IntervalStage(
+          key: 'work',
+          title: 'Работа · $repeat из $_intervalRepeats',
+          remainingSeconds: work - remaining,
+          repeatNumber: repeat,
+          finished: false,
+        );
+      }
+      remaining -= work;
+      if (repeat < _intervalRepeats && recovery > 0) {
+        if (remaining < recovery) {
+          return _IntervalStage(
+            key: 'recovery',
+            title: 'Восстановление · $repeat из $_intervalRepeats',
+            remainingSeconds: recovery - remaining,
+            repeatNumber: repeat,
+            finished: false,
+          );
+        }
+        remaining -= recovery;
+      }
+    }
+
+    if (cooldown > 0 && remaining < cooldown) {
+      return _IntervalStage(
+        key: 'cooldown',
+        title: 'Заминка',
+        remainingSeconds: cooldown - remaining,
+        repeatNumber: _intervalRepeats,
+        finished: false,
+      );
+    }
+    return _IntervalStage(
+      key: 'finished',
+      title: 'Задание выполнено',
+      remainingSeconds: 0,
+      repeatNumber: _intervalRepeats,
+      finished: true,
+    );
+  }
+
+  List<int>? _targetBoundsForCurrentMoment() {
+    if (_workoutMode == 'intensity') {
+      if (_intensityUsesManualRange) {
+        return <int>[_manualTargetMin, _manualTargetMax];
+      }
+      return _zoneBounds(_intensityTargetZone, _workoutHeartRateZones);
+    }
+    if (_workoutMode == 'interval' &&
+        _intervalUsesHeartRate &&
+        _intervalStageAt(_elapsedSeconds).key == 'work') {
+      return _zoneBounds(_intervalTargetZone, _workoutHeartRateZones);
+    }
+    return null;
+  }
+
+  void _handleHeartRateSample(Map<String, dynamic> sample) {
+    final bpm = _asInt(sample['bpm']);
+    final timestamp = DateTime.tryParse(sample['timestamp']?.toString() ?? '');
+    if (bpm < 25 || bpm > 250 || timestamp == null) return;
+    final previousTargetStatus = _targetStatus;
+
+    if (_isTracking && !_isPaused) {
+      _coachHeartRateSampleCount++;
+      _coachHeartRateSum += bpm;
+      _coachHeartRateMax = max(_coachHeartRateMax, bpm);
+      final previousAt = _lastCoachHeartRateAt;
+      final previousBpm = _lastCoachHeartRateBpm;
+      if (previousAt != null && previousBpm != null) {
+        final delta = timestamp.difference(previousAt).inMilliseconds;
+        if (delta > 0 && delta <= 5000) {
+          _heartRateCoveredMilliseconds += delta;
+          final zone = _zoneForBpm(previousBpm);
+          if (zone != null) _heartRateZoneMilliseconds[zone - 1] += delta;
+          final bounds = _targetBoundsForCurrentMoment();
+          if (bounds != null) {
+            if (previousBpm < bounds[0]) {
+              _belowTargetMilliseconds += delta;
+              _continuousBelowMilliseconds += delta;
+              _continuousAboveMilliseconds = 0;
+              if (_continuousBelowMilliseconds >= 20000) {
+                _targetStatus = 'below';
+              }
+            } else if (previousBpm > bounds[1]) {
+              _aboveTargetMilliseconds += delta;
+              _continuousAboveMilliseconds += delta;
+              _continuousBelowMilliseconds = 0;
+              if (_continuousAboveMilliseconds >= 20000) {
+                _targetStatus = 'above';
+              }
+            } else {
+              _insideTargetMilliseconds += delta;
+              _continuousBelowMilliseconds = 0;
+              _continuousAboveMilliseconds = 0;
+              _targetStatus = 'inside';
+            }
+          } else {
+            _continuousBelowMilliseconds = 0;
+            _continuousAboveMilliseconds = 0;
+            _targetStatus = 'waiting';
+          }
+        }
+      }
+      _lastCoachHeartRateAt = timestamp;
+      _lastCoachHeartRateBpm = bpm;
+    } else {
+      _lastCoachHeartRateAt = null;
+      _lastCoachHeartRateBpm = null;
+    }
+    _announceTargetStatusIfNeeded(previousTargetStatus);
+    if (mounted) setState(() {});
+  }
+
+  void _resetCoachStatistics() {
+    for (var index = 0; index < 5; index++) {
+      _heartRateZoneMilliseconds[index] = 0;
+    }
+    _heartRateCoveredMilliseconds = 0;
+    _coachHeartRateSampleCount = 0;
+    _coachHeartRateSum = 0;
+    _coachHeartRateMax = 0;
+    _lastCoachHeartRateAt = null;
+    _lastCoachHeartRateBpm = null;
+    _belowTargetMilliseconds = 0;
+    _insideTargetMilliseconds = 0;
+    _aboveTargetMilliseconds = 0;
+    _continuousBelowMilliseconds = 0;
+    _continuousAboveMilliseconds = 0;
+    _targetStatus = 'waiting';
+    _lastSpokenTargetStatus = null;
+    _lastSpokenIntervalStage = null;
+    _lastSpokenIntervalCountdown = null;
+    _freeGoalCompletionSpoken = false;
+    _lastSpokenFreeSummaryIndex = 0;
+    _lastPersistedCoachSecond = -1;
+  }
+
+  Map<String, dynamic> _workoutConfiguration() => {
+    'version': 1,
+    'mode': _workoutMode,
+    'sport': _sportType,
+    'voice_enabled': _voiceEnabled,
+    if (_workoutMode == 'free') ...{
+      'goal_type': _freeGoalType,
+      if (_freeGoalType == 'time') 'goal_minutes': _freeGoalMinutes,
+      if (_freeGoalType == 'distance') 'goal_distance_km': _freeGoalDistanceKm,
+      'audio_summary_type': _audioSummaryType,
+    },
+    if (_workoutMode == 'intensity') ...{
+      'target_type': _intensityUsesManualRange ? 'range' : 'zone',
+      if (_intensityUsesManualRange) ...{
+        'target_min_bpm': _manualTargetMin,
+        'target_max_bpm': _manualTargetMax,
+      } else
+        'target_zone': _intensityTargetZone,
+      'alert_delay_seconds': 20,
+    },
+    if (_workoutMode == 'interval') ...{
+      'warmup_minutes': _intervalWarmupMinutes,
+      'work_minutes': _intervalWorkMinutes,
+      'recovery_minutes': _intervalRecoveryMinutes,
+      'repeats': _intervalRepeats,
+      'cooldown_minutes': _intervalCooldownMinutes,
+      'heart_rate_control': _intervalUsesHeartRate,
+      if (_intervalUsesHeartRate) 'target_zone': _intervalTargetZone,
+    },
+  };
+
+  Map<String, dynamic> _workoutResult() {
+    final coverage = _elapsedSeconds <= 0
+        ? 0.0
+        : min(100.0, _heartRateCoveredMilliseconds / (_elapsedSeconds * 10.0));
+    return {
+      'version': 1,
+      'mode': _workoutMode,
+      'duration_seconds': _elapsedSeconds,
+      'heart_rate_covered_seconds': (_heartRateCoveredMilliseconds / 1000)
+          .round(),
+      'heart_rate_coverage_percent': coverage,
+      'below_target_seconds': (_belowTargetMilliseconds / 1000).round(),
+      'inside_target_seconds': (_insideTargetMilliseconds / 1000).round(),
+      'above_target_seconds': (_aboveTargetMilliseconds / 1000).round(),
+      if (_workoutMode == 'interval') ...{
+        'completed_repeats': min(
+          _intervalRepeats,
+          _intervalStageAt(_elapsedSeconds).repeatNumber,
+        ),
+        'assignment_finished': _intervalStageAt(_elapsedSeconds).finished,
+      },
+    };
+  }
+
+  String _heartRateDataQuality(int durationSeconds) {
+    if (durationSeconds <= 0 || _heartRateCoveredMilliseconds <= 0) {
+      return 'none';
+    }
+    final coverage =
+        _heartRateCoveredMilliseconds / (durationSeconds * 1000) * 100;
+    if (coverage >= 90) return 'high';
+    if (coverage >= 60) return 'partial';
+    return 'low';
+  }
+
+  List<int> _heartRateZoneSecondsForDuration(int durationSeconds) {
+    final result = _heartRateZoneMilliseconds
+        .map((milliseconds) => milliseconds ~/ 1000)
+        .toList(growable: false);
+    var excess =
+        (result.fold<int>(0, (sum, value) => sum + value) -
+                max(0, durationSeconds))
+            .toInt();
+    for (var index = result.length - 1; index >= 0 && excess > 0; index--) {
+      final reduction = min(excess, result[index]);
+      result[index] -= reduction;
+      excess -= reduction;
+    }
+    return result;
+  }
+
+  Future<void> _persistCoachState() async {
+    final workoutId = _workoutId;
+    if (workoutId == null || workoutId.isEmpty || !_isTracking) return;
+    try {
+      await _offlineManager.updateDiaryData(
+        workoutId: workoutId,
+        diaryData: _buildDiaryData({
+          'duration_seconds': _elapsedSeconds,
+          'distance_km': _distanceMeters / 1000,
+        }),
+      );
+    } catch (error) {
+      debugPrint('Не удалось сохранить состояние тренировки: $error');
+    }
+  }
+
+  void _restoreCoachState(Map<String, dynamic> diaryData) {
+    final mode = diaryData['workout_mode']?.toString();
+    if (mode == 'free' || mode == 'intensity' || mode == 'interval') {
+      _workoutMode = mode!;
+    }
+    try {
+      final configValue = diaryData['workout_config_json'];
+      final config = configValue is Map
+          ? Map<String, dynamic>.from(configValue)
+          : jsonDecode(configValue?.toString() ?? '{}');
+      if (config is Map) {
+        _freeGoalType = config['goal_type']?.toString() ?? _freeGoalType;
+        if (config.containsKey('goal_minutes')) {
+          _freeGoalMinutes = _asInt(
+            config['goal_minutes'],
+          ).clamp(1, 1440).toInt();
+        }
+        if (config.containsKey('goal_distance_km')) {
+          _freeGoalDistanceKm = _asDouble(
+            config['goal_distance_km'],
+          ).clamp(0.1, 1000).toDouble();
+        }
+        _audioSummaryType =
+            config['audio_summary_type']?.toString() ?? _audioSummaryType;
+        if (config.containsKey('voice_enabled')) {
+          _voiceEnabled = config['voice_enabled'] == true;
+        }
+        if (config.containsKey('target_type')) {
+          _intensityUsesManualRange = config['target_type'] == 'range';
+        }
+        if (config.containsKey('target_min_bpm')) {
+          _manualTargetMin = _asInt(
+            config['target_min_bpm'],
+          ).clamp(40, 239).toInt();
+        }
+        if (config.containsKey('target_max_bpm')) {
+          _manualTargetMax = _asInt(
+            config['target_max_bpm'],
+          ).clamp(41, 240).toInt();
+        }
+        if (_workoutMode == 'intensity' && config.containsKey('target_zone')) {
+          _intensityTargetZone = _asInt(
+            config['target_zone'],
+          ).clamp(1, 5).toInt();
+        }
+        if (config.containsKey('warmup_minutes')) {
+          _intervalWarmupMinutes = _asInt(
+            config['warmup_minutes'],
+          ).clamp(0, 180).toInt();
+        }
+        if (config.containsKey('work_minutes')) {
+          _intervalWorkMinutes = _asInt(
+            config['work_minutes'],
+          ).clamp(1, 180).toInt();
+        }
+        if (config.containsKey('recovery_minutes')) {
+          _intervalRecoveryMinutes = _asInt(
+            config['recovery_minutes'],
+          ).clamp(0, 180).toInt();
+        }
+        if (config.containsKey('repeats')) {
+          _intervalRepeats = _asInt(config['repeats']).clamp(1, 50).toInt();
+        }
+        if (config.containsKey('cooldown_minutes')) {
+          _intervalCooldownMinutes = _asInt(
+            config['cooldown_minutes'],
+          ).clamp(0, 180).toInt();
+        }
+        if (config.containsKey('heart_rate_control')) {
+          _intervalUsesHeartRate = config['heart_rate_control'] == true;
+        }
+        if (_workoutMode == 'interval' && config.containsKey('target_zone')) {
+          _intervalTargetZone = _asInt(
+            config['target_zone'],
+          ).clamp(1, 5).toInt();
+        }
+      }
+      final zonesValue = diaryData['hr_zones_snapshot'];
+      if (zonesValue != null) {
+        final decoded = zonesValue is Map
+            ? Map<String, dynamic>.from(zonesValue)
+            : jsonDecode(zonesValue.toString());
+        if (decoded is Map) {
+          final configured = Map<String, dynamic>.from(decoded)
+            ..['configured'] = true;
+          _workoutHeartRateZones = _parseHeartRateZones(configured);
+        }
+      }
+      for (var zone = 1; zone <= 5; zone++) {
+        _heartRateZoneMilliseconds[zone - 1] =
+            _asInt(diaryData['hr_zone${zone}_seconds']) * 1000;
+      }
+      _coachHeartRateSampleCount = _asInt(diaryData['heart_rate_sample_count']);
+      _coachHeartRateMax = _asInt(diaryData['max_pulse']);
+      _coachHeartRateSum =
+          _asInt(diaryData['avg_pulse']) * _coachHeartRateSampleCount;
+      final resultValue = diaryData['workout_result_json'];
+      final result = resultValue is Map
+          ? Map<String, dynamic>.from(resultValue)
+          : jsonDecode(resultValue?.toString() ?? '{}');
+      if (result is Map) {
+        _heartRateCoveredMilliseconds =
+            _asInt(result['heart_rate_covered_seconds']) * 1000;
+        _belowTargetMilliseconds =
+            _asInt(result['below_target_seconds']) * 1000;
+        _insideTargetMilliseconds =
+            _asInt(result['inside_target_seconds']) * 1000;
+        _aboveTargetMilliseconds =
+            _asInt(result['above_target_seconds']) * 1000;
+      }
+    } catch (error) {
+      debugPrint('Не удалось восстановить настройки тренировки: $error');
+    }
   }
 
   @override
@@ -311,28 +1148,27 @@ class _KlsGpsWorkoutRecorderWidgetState
     }
 
     _createGpsFilter();
+    unawaited(_initializeVoice());
 
-    _heartRateSubscription = KlsHeartRateDeviceWidget.bpmStream.listen(
-      (_) {
-        if (mounted) setState(() {});
-      },
+    _heartRateSubscription = KlsHeartRateDeviceWidget.sampleStream.listen(
+      _handleHeartRateSample,
       onError: (Object error) {
         debugPrint('Heart rate stream error: $error');
       },
     );
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(_initializeOfflineState());
+      if (mounted) {
+        unawaited(_initializeOfflineState());
+        unawaited(_loadHeartRateZones());
+      }
     });
 
-    _syncTimer = Timer.periodic(
-      const Duration(seconds: 30),
-      (_) {
-        if (!_awaitingDiarySave) {
-          unawaited(_offlineManager.syncPendingWorkouts());
-        }
-      },
-    );
+    _syncTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (!_awaitingDiarySave) {
+        unawaited(_offlineManager.syncPendingWorkouts());
+      }
+    });
   }
 
   @override
@@ -371,6 +1207,10 @@ class _KlsGpsWorkoutRecorderWidgetState
   void didUpdateWidget(covariant KlsGpsWorkoutRecorderWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
 
+    if (oldWidget.currentUserId != widget.currentUserId) {
+      unawaited(_loadHeartRateZones());
+    }
+
     if (_isTracking || _isStarting) return;
 
     if (oldWidget.plannedActivityType != widget.plannedActivityType) {
@@ -392,6 +1232,7 @@ class _KlsGpsWorkoutRecorderWidgetState
     _syncTimer?.cancel();
     _positionSub?.cancel();
     _heartRateSubscription?.cancel();
+    unawaited(_stopVoice());
 
     // A real workout owns a durable native GPS session and must continue if
     // FlutterFlow rebuilds/disposes this widget. Only a preparation preview is
@@ -468,8 +1309,12 @@ class _KlsGpsWorkoutRecorderWidgetState
       _isPaused = workout.isPaused;
       _isTracking = true;
       _isLocating = false;
-      _gpsNativeRunning = nativeState.isTracking &&
-          nativeState.workoutId == workout.workoutId;
+      _setupStep = 2;
+      _gpsNativeRunning =
+          nativeState.isTracking && nativeState.workoutId == workout.workoutId;
+
+      _restoreCoachState(workout.diaryData);
+      KlsHeartRateDeviceWidget.startWorkoutSession();
 
       await _rebuildRouteFromJournal(workout.workoutId);
 
@@ -584,11 +1429,11 @@ class _KlsGpsWorkoutRecorderWidgetState
   }
 
   void _captureHeartRateSummary() {
-    if (KlsHeartRateDeviceWidget.hasWorkoutHeartRateData) {
-      _finishedAverageBpm = KlsHeartRateDeviceWidget.workoutAverageBpm;
-      _finishedMaxBpm = KlsHeartRateDeviceWidget.workoutMaxBpm;
-      _finishedHeartRateSampleCount =
-          KlsHeartRateDeviceWidget.workoutHeartRateSampleCount;
+    if (_coachHeartRateSampleCount > 0) {
+      _finishedAverageBpm = (_coachHeartRateSum / _coachHeartRateSampleCount)
+          .round();
+      _finishedMaxBpm = _coachHeartRateMax;
+      _finishedHeartRateSampleCount = _coachHeartRateSampleCount;
       final name = KlsHeartRateDeviceWidget.sensorName.trim();
       _finishedHeartRateDeviceName = name.isEmpty ? 'Пульсометр' : name;
     } else {
@@ -620,7 +1465,9 @@ class _KlsGpsWorkoutRecorderWidgetState
         }),
       );
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        debugPrint('Не удалось записать $eventName: HTTP ${response.statusCode}');
+        debugPrint(
+          'Не удалось записать $eventName: HTTP ${response.statusCode}',
+        );
       }
     } catch (error) {
       debugPrint('Ошибка отправки $eventName: $error');
@@ -631,8 +1478,9 @@ class _KlsGpsWorkoutRecorderWidgetState
     final previewPosition = preserveCurrentLocation ? _currentPosition : null;
     final previewAccuracy = preserveCurrentLocation ? _accuracy : 0.0;
     final previewHeading = preserveCurrentLocation ? _heading : 0.0;
-    final previewAltitude =
-        preserveCurrentLocation ? _currentAltitudeMeters : null;
+    final previewAltitude = preserveCurrentLocation
+        ? _currentAltitudeMeters
+        : null;
     final previewFixAt = preserveCurrentLocation && previewPosition != null
         ? previewPosition.timestamp.toLocal()
         : null;
@@ -687,6 +1535,8 @@ class _KlsGpsWorkoutRecorderWidgetState
     _finishedMaxBpm = null;
     _finishedHeartRateSampleCount = 0;
     _finishedHeartRateDeviceName = null;
+    _workoutHeartRateZones = null;
+    _resetCoachStatistics();
 
     _createGpsFilter();
   }
@@ -705,8 +1555,53 @@ class _KlsGpsWorkoutRecorderWidgetState
     await Future<void>.delayed(const Duration(milliseconds: 140));
   }
 
+  String? _validateWorkoutConfiguration() {
+    if (_workoutMode == 'intensity') {
+      if (!_heartRateConnected) {
+        return 'Для контроля интенсивности подключите пульсометр';
+      }
+      if (_intensityUsesManualRange) {
+        if (_manualTargetMin < 40 ||
+            _manualTargetMax > 240 ||
+            _manualTargetMin >= _manualTargetMax) {
+          return 'Проверьте ручной диапазон пульса';
+        }
+      } else if (_profileHeartRateZones == null) {
+        return 'Зоны не настроены. Выберите ручной диапазон';
+      }
+    }
+    if (_workoutMode == 'interval') {
+      if (_intervalWorkMinutes <= 0 || _intervalRepeats <= 0) {
+        return 'Укажите время работы и количество повторов';
+      }
+      if (_intervalUsesHeartRate) {
+        if (!_heartRateConnected) {
+          return 'Для контроля интервалов подключите пульсометр';
+        }
+        if (_profileHeartRateZones == null) {
+          return 'Для контроля интервалов сначала настройте зоны';
+        }
+      }
+    }
+    return null;
+  }
+
+  void _goToSetupStep(int step) {
+    if (_isStarting || _isTracking) return;
+    setState(() {
+      _setupStep = step.clamp(0, 2).toInt();
+      _errorText = null;
+    });
+  }
+
   Future<void> _startWorkout() async {
     if (_isRestoring || _isStarting || _isTracking) return;
+
+    final configurationError = _validateWorkoutConfiguration();
+    if (configurationError != null) {
+      setState(() => _errorText = configurationError);
+      return;
+    }
 
     setState(() {
       _isStarting = true;
@@ -747,12 +1642,14 @@ class _KlsGpsWorkoutRecorderWidgetState
 
       final title =
           _hasPlanContext && (widget.plannedTitle?.trim().isNotEmpty ?? false)
-              ? widget.plannedTitle!.trim()
-              : _selectedSport.diaryType;
+          ? widget.plannedTitle!.trim()
+          : _selectedSport.diaryType;
 
       await _runCountdown();
       if (!mounted) return;
 
+      _workoutHeartRateZones = _profileHeartRateZones;
+      _resetCoachStatistics();
       KlsHeartRateDeviceWidget.startWorkoutSession();
 
       final localStart = DateTime.now();
@@ -762,7 +1659,7 @@ class _KlsGpsWorkoutRecorderWidgetState
         title: title,
         diaryType: _selectedSport.diaryType,
         usesGps: true,
-        isInterval: false,
+        isInterval: _workoutMode == 'interval',
         endpoints: _endpoints,
         startedAt: localStart,
         diaryData: _initialDiaryData(),
@@ -790,6 +1687,20 @@ class _KlsGpsWorkoutRecorderWidgetState
 
       _startTimer();
       await _startGpsStream();
+      _updateVoiceGuidance();
+      if (_workoutMode == 'free') {
+        unawaited(_speak('Тренировка началась.'));
+      } else if (_workoutMode == 'intensity') {
+        final bounds = _targetBoundsForCurrentMoment();
+        unawaited(
+          _speak(
+            bounds == null
+                ? 'Тренировка началась.'
+                : 'Тренировка началась. Держите пульс от ${bounds[0]} '
+                      'до ${bounds[1]} ударов в минуту.',
+          ),
+        );
+      }
 
       unawaited(
         _trackEvent(
@@ -798,6 +1709,7 @@ class _KlsGpsWorkoutRecorderWidgetState
             'workout_id': workoutId,
             'sport_type': _sportType,
             'training_type': _selectedSport.diaryType,
+            'workout_mode': _workoutMode,
             'uses_gps': true,
             'offline_first': true,
             'background_gps_capable': _backgroundGpsCapable,
@@ -858,20 +1770,24 @@ class _KlsGpsWorkoutRecorderWidgetState
 
   void _startTimer() {
     _timer?.cancel();
-    _timer = Timer.periodic(
-      const Duration(seconds: 1),
-      (_) {
-        if (!_isTracking || _isPaused || _startedAt == null || !mounted) {
-          return;
-        }
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!_isTracking || _isPaused || _startedAt == null || !mounted) {
+        return;
+      }
 
-        setState(() {
-          _elapsedSeconds =
-              DateTime.now().difference(_startedAt!).inSeconds - _pauseSeconds;
-          if (_elapsedSeconds < 0) _elapsedSeconds = 0;
-        });
-      },
-    );
+      setState(() {
+        _elapsedSeconds =
+            DateTime.now().difference(_startedAt!).inSeconds - _pauseSeconds;
+        if (_elapsedSeconds < 0) _elapsedSeconds = 0;
+      });
+      if (_elapsedSeconds > 0 &&
+          _elapsedSeconds % 15 == 0 &&
+          _lastPersistedCoachSecond != _elapsedSeconds) {
+        _lastPersistedCoachSecond = _elapsedSeconds;
+        unawaited(_persistCoachState());
+      }
+      _updateVoiceGuidance();
+    });
   }
 
   Future<void> _startLocationPreview() async {
@@ -957,7 +1873,8 @@ class _KlsGpsWorkoutRecorderWidgetState
   void _handlePreviewPosition(KlsGpsPoint position) {
     final age = DateTime.now().difference(position.timestamp).inSeconds.abs();
 
-    final validCoordinates = position.latitude.isFinite &&
+    final validCoordinates =
+        position.latitude.isFinite &&
         position.longitude.isFinite &&
         position.latitude >= -90 &&
         position.latitude <= 90 &&
@@ -965,7 +1882,8 @@ class _KlsGpsWorkoutRecorderWidgetState
         position.longitude <= 180 &&
         !(position.latitude == 0 && position.longitude == 0);
 
-    final validAccuracy = position.accuracyMeters.isFinite &&
+    final validAccuracy =
+        position.accuracyMeters.isFinite &&
         position.accuracyMeters > 0 &&
         position.accuracyMeters <= 200;
 
@@ -1066,10 +1984,7 @@ class _KlsGpsWorkoutRecorderWidgetState
     }
   }
 
-  void _handlePosition(
-    KlsGpsPoint position, {
-    bool notify = true,
-  }) {
+  void _handlePosition(KlsGpsPoint position, {bool notify = true}) {
     if (_isDuplicateWorkoutPoint(position)) return;
 
     final filter = _gpsFilter;
@@ -1200,7 +2115,8 @@ class _KlsGpsWorkoutRecorderWidgetState
       return;
     }
 
-    var delta = ((nextBearing - _movementBearingDegrees + 540.0) % 360.0) - 180.0;
+    var delta =
+        ((nextBearing - _movementBearingDegrees + 540.0) % 360.0) - 180.0;
     if (delta > 80) delta = 80;
     if (delta < -80) delta = -80;
 
@@ -1213,8 +2129,7 @@ class _KlsGpsWorkoutRecorderWidgetState
     final phi2 = to.lat * pi / 180;
     final deltaLambda = (to.lng - from.lng) * pi / 180;
     final y = sin(deltaLambda) * cos(phi2);
-    final x = cos(phi1) * sin(phi2) -
-        sin(phi1) * cos(phi2) * cos(deltaLambda);
+    final x = cos(phi1) * sin(phi2) - sin(phi1) * cos(phi2) * cos(deltaLambda);
     return (atan2(y, x) * 180 / pi + 360.0) % 360.0;
   }
 
@@ -1224,11 +2139,10 @@ class _KlsGpsWorkoutRecorderWidgetState
     final phi2 = b.lat * pi / 180;
     final dPhi = (b.lat - a.lat) * pi / 180;
     final dLambda = (b.lng - a.lng) * pi / 180;
-    final h = sin(dPhi / 2) * sin(dPhi / 2) +
+    final h =
+        sin(dPhi / 2) * sin(dPhi / 2) +
         cos(phi1) * cos(phi2) * sin(dLambda / 2) * sin(dLambda / 2);
-    return radius *
-        2 *
-        atan2(sqrt(h), sqrt(max(0.0, 1.0 - h)));
+    return radius * 2 * atan2(sqrt(h), sqrt(max(0.0, 1.0 - h)));
   }
 
   void _updateElevation(double? rawAltitude) {
@@ -1386,6 +2300,8 @@ class _KlsGpsWorkoutRecorderWidgetState
 
     setState(() {
       _isPaused = true;
+      _lastCoachHeartRateAt = null;
+      _lastCoachHeartRateBpm = null;
       _pausedAt = pausedAt;
       _currentSpeedMps = 0;
       _liveSpeedWindow.clear();
@@ -1405,6 +2321,7 @@ class _KlsGpsWorkoutRecorderWidgetState
     }
 
     if (mounted) setState(() {});
+    unawaited(_speak('Пауза.'));
   }
 
   Future<void> _resumeWorkout() async {
@@ -1421,6 +2338,8 @@ class _KlsGpsWorkoutRecorderWidgetState
 
     setState(() {
       _isPaused = false;
+      _lastCoachHeartRateAt = null;
+      _lastCoachHeartRateBpm = null;
       _pausedAt = null;
       _currentSpeedMps = 0;
       _liveSpeedWindow.clear();
@@ -1437,6 +2356,7 @@ class _KlsGpsWorkoutRecorderWidgetState
     try {
       await _startGpsStream();
       await _replayNewJournalPoints();
+      unawaited(_speak('Тренировка продолжена.'));
     } catch (error) {
       if (mounted) {
         setState(() {
@@ -1478,6 +2398,10 @@ class _KlsGpsWorkoutRecorderWidgetState
 
   Future<void> _handleBackPressed() async {
     if (!_isTracking) {
+      if (_setupStep > 0) {
+        _goToSetupStep(_setupStep - 1);
+        return;
+      }
       Navigator.of(context).maybePop();
       return;
     }
@@ -1486,13 +2410,13 @@ class _KlsGpsWorkoutRecorderWidgetState
       context: context,
       builder: (dialogContext) => AlertDialog(
         backgroundColor: _klsNavy,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
         title: const Text(
           'Выйти из записи?',
           style: TextStyle(
             color: Colors.white,
             fontFamily: 'Montserrat',
-            fontWeight: FontWeight.w700,
+            fontWeight: FontWeight.w500,
           ),
         ),
         content: Text(
@@ -1540,13 +2464,15 @@ class _KlsGpsWorkoutRecorderWidgetState
         context: context,
         builder: (dialogContext) => AlertDialog(
           backgroundColor: _klsNavy,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(18),
+          ),
           title: const Text(
             'Слишком короткая тренировка',
             style: TextStyle(
               color: Colors.white,
               fontFamily: 'Montserrat',
-              fontWeight: FontWeight.w700,
+              fontWeight: FontWeight.w500,
             ),
           ),
           content: Text(
@@ -1571,13 +2497,13 @@ class _KlsGpsWorkoutRecorderWidgetState
       context: context,
       builder: (dialogContext) => AlertDialog(
         backgroundColor: _klsNavy,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
         title: const Text(
           'Завершить тренировку?',
           style: TextStyle(
             color: Colors.white,
             fontFamily: 'Montserrat',
-            fontWeight: FontWeight.w700,
+            fontWeight: FontWeight.w500,
           ),
         ),
         content: Text(
@@ -1604,6 +2530,7 @@ class _KlsGpsWorkoutRecorderWidgetState
     );
 
     if (confirmed != true || !mounted) return;
+    unawaited(_speak('Тренировка завершена.'));
 
     setState(() {
       _isFinishing = true;
@@ -1648,8 +2575,9 @@ class _KlsGpsWorkoutRecorderWidgetState
       _completeTrailingLap();
 
       final distanceKm = _distanceMeters / 1000;
-      final avgSpeedMps =
-          _elapsedSeconds > 0 ? _distanceMeters / _elapsedSeconds : 0.0;
+      final avgSpeedMps = _elapsedSeconds > 0
+          ? _distanceMeters / _elapsedSeconds
+          : 0.0;
 
       final localResult = <String, dynamic>{
         'success': true,
@@ -1663,8 +2591,9 @@ class _KlsGpsWorkoutRecorderWidgetState
         'avg_speed_kmh': avgSpeedMps * 3.6,
         'max_speed_mps': _maxSpeedMps,
         'max_speed_kmh': _maxSpeedMps * 3.6,
-        'avg_pace_seconds_per_km':
-            distanceKm > 0 ? _elapsedSeconds / distanceKm : 0.0,
+        'avg_pace_seconds_per_km': distanceKm > 0
+            ? _elapsedSeconds / distanceKm
+            : 0.0,
         'elevation_gain_meters': _elevationGainMeters,
       };
 
@@ -1736,8 +2665,9 @@ class _KlsGpsWorkoutRecorderWidgetState
         '${now.year.toString().padLeft(4, '0')}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
 
     final plannedDate = widget.plannedDate?.trim() ?? '';
-    final date =
-        _hasPlanContext && plannedDate.isNotEmpty ? plannedDate : actualDate;
+    final date = _hasPlanContext && plannedDate.isNotEmpty
+        ? plannedDate
+        : actualDate;
     final plannedTitle = widget.plannedTitle?.trim() ?? '';
     final plannedDescription = widget.plannedDescription?.trim() ?? '';
 
@@ -1747,6 +2677,22 @@ class _KlsGpsWorkoutRecorderWidgetState
     final description = _hasPlanContext && plannedDescription.isNotEmpty
         ? plannedDescription
         : 'GPS-тренировка КЛС';
+    final coveragePercent = durationSeconds <= 0
+        ? 0.0
+        : min(100.0, _heartRateCoveredMilliseconds / (durationSeconds * 10.0));
+    final heartRateProvider =
+        (_finishedHeartRateDeviceName?.trim().isNotEmpty ?? false)
+        ? _finishedHeartRateDeviceName!.trim()
+        : _heartRateDeviceName;
+    final zoneSeconds = _heartRateZoneSecondsForDuration(durationSeconds);
+    final currentAverageBpm =
+        _finishedAverageBpm ??
+        (_coachHeartRateSampleCount > 0
+            ? (_coachHeartRateSum / _coachHeartRateSampleCount).round()
+            : null);
+    final currentMaxBpm =
+        _finishedMaxBpm ??
+        (_coachHeartRateSampleCount > 0 ? _coachHeartRateMax : null);
 
     return <String, dynamic>{
       'training_id': _workoutId,
@@ -1757,9 +2703,10 @@ class _KlsGpsWorkoutRecorderWidgetState
       'training_type': _selectedSport.diaryType,
       'activity_type_code': _sportType,
       'duration_minutes': max(1, (durationSeconds / 60).round()),
+      'duration_seconds': durationSeconds,
       'distance_km': _asDouble(data['distance_km']),
-      if (_finishedAverageBpm != null) 'avg_pulse': _finishedAverageBpm,
-      if (_finishedMaxBpm != null) 'max_pulse': _finishedMaxBpm,
+      if (currentAverageBpm != null) 'avg_pulse': currentAverageBpm,
+      if (currentMaxBpm != null) 'max_pulse': currentMaxBpm,
       'wellbeing': _wellbeing,
       'comment': _commentController.text.trim(),
       'rpe': _rpe,
@@ -1770,7 +2717,20 @@ class _KlsGpsWorkoutRecorderWidgetState
       'motivation': 4,
       'source': 'kls_gps',
       'gps_workout_id': _workoutId,
-      'is_interval': false,
+      'is_interval': _workoutMode == 'interval',
+      'workout_mode': _workoutMode,
+      'workout_config_json': jsonEncode(_workoutConfiguration()),
+      'workout_result_json': jsonEncode(_workoutResult()),
+      if (_workoutHeartRateZones != null)
+        'hr_zones_snapshot': jsonEncode(_workoutHeartRateZones!.toJson()),
+      'heart_rate_sample_count': _coachHeartRateSampleCount,
+      'heart_rate_coverage_percent': coveragePercent,
+      'heart_rate_data_quality': _heartRateDataQuality(durationSeconds),
+      if (_coachHeartRateSampleCount > 0) 'heart_rate_source': 'ble',
+      if (_coachHeartRateSampleCount > 0)
+        'heart_rate_provider': heartRateProvider,
+      for (var zone = 1; zone <= 5; zone++)
+        'hr_zone${zone}_seconds': zoneSeconds[zone - 1],
       'elevation_gain_m': _elevationGainMeters.round(),
       'lap_count': _laps.length,
       'laps_json': jsonEncode(_laps.map((lap) => lap.toJson()).toList()),
@@ -1787,8 +2747,8 @@ class _KlsGpsWorkoutRecorderWidgetState
       if (_hasPlanContext)
         'plan_completion_status':
             widget.planCompletionStatus?.trim().isNotEmpty == true
-                ? widget.planCompletionStatus!.trim()
-                : 'completed',
+            ? widget.planCompletionStatus!.trim()
+            : 'completed',
     };
   }
 
@@ -1980,7 +2940,7 @@ class _KlsGpsWorkoutRecorderWidgetState
       SnackBar(
         content: Text(text),
         behavior: SnackBarBehavior.floating,
-        backgroundColor: const Color(0xFF0E1D36),
+        backgroundColor: const Color(0xFF091B2A),
       ),
     );
   }
@@ -1990,25 +2950,17 @@ class _KlsGpsWorkoutRecorderWidgetState
     return Container(
       width: widget.width ?? double.infinity,
       height: widget.height ?? double.infinity,
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          colors: [
-            Color(0xFF030B16),
-            Color(0xFF061B34),
-            Color(0xFF031326),
-          ],
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-        ),
-      ),
+      color: const Color(0xFF061522),
       child: SafeArea(
         child: Stack(
           children: [
             Positioned.fill(
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
+                padding: const EdgeInsets.fromLTRB(18, 12, 18, 16),
                 child: _isTracking
                     ? _buildTrackingScreen()
+                    : _setupStep < 2
+                    ? _buildSetupScreen()
                     : _buildPreparationScreen(),
               ),
             ),
@@ -2019,25 +2971,291 @@ class _KlsGpsWorkoutRecorderWidgetState
     );
   }
 
+  Widget _buildSetupScreen() {
+    return Column(
+      children: [
+        _header(),
+        const SizedBox(height: 18),
+        _setupProgress(),
+        const SizedBox(height: 24),
+        Expanded(
+          child: SingleChildScrollView(
+            physics: const BouncingScrollPhysics(),
+            child: _setupStep == 0 ? _sportSetupStep() : _modeSetupStep(),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _setupProgress() {
+    return Row(
+      children: List.generate(3, (index) {
+        final active = index <= _setupStep;
+        return Expanded(
+          child: Container(
+            height: 2,
+            margin: EdgeInsets.only(right: index == 2 ? 0 : 8),
+            decoration: BoxDecoration(
+              color: active ? _klsGold : const Color(0x18FFFFFF),
+              borderRadius: BorderRadius.circular(99),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  Widget _sportSetupStep() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Что вы сегодня делаете?',
+          style: TextStyle(
+            fontFamily: 'Montserrat',
+            color: Color(0xFFF5F7FA),
+            fontSize: 26,
+            height: 1.08,
+            fontWeight: FontWeight.w400,
+            letterSpacing: -0.55,
+          ),
+        ),
+        const SizedBox(height: 7),
+        Text('Выберите вид активности', style: _mutedTextStyle(11.5)),
+        const SizedBox(height: 22),
+        GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 2,
+            childAspectRatio: 1.7,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+          ),
+          itemCount: _sports.length,
+          itemBuilder: (context, index) {
+            final sport = _sports[index];
+            final selected = sport.key == _sportType;
+            return _setupChoiceCard(
+              title: sport.title,
+              subtitle: '',
+              icon: sport.icon,
+              selected: selected,
+              onTap: () => _selectSport(sport),
+            );
+          },
+        ),
+        const SizedBox(height: 24),
+        _setupNextButton('Далее', () => _goToSetupStep(1)),
+      ],
+    );
+  }
+
+  Widget _modeSetupStep() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Как тренируемся?',
+          style: TextStyle(
+            fontFamily: 'Montserrat',
+            color: Color(0xFFF5F7FA),
+            fontSize: 26,
+            height: 1.08,
+            fontWeight: FontWeight.w400,
+            letterSpacing: -0.55,
+          ),
+        ),
+        const SizedBox(height: 7),
+        Text(
+          _selectedSport.title,
+          style: const TextStyle(
+            fontFamily: 'Montserrat',
+            color: _klsGold,
+            fontSize: 10.5,
+            fontWeight: FontWeight.w500,
+            letterSpacing: 0.35,
+          ),
+        ),
+        const SizedBox(height: 22),
+        _modeCard(
+          keyName: 'free',
+          title: 'Свободная',
+          subtitle: 'Запись маршрута, времени, темпа и пульса',
+          icon: Icons.route_outlined,
+        ),
+        const SizedBox(height: 8),
+        _modeCard(
+          keyName: 'intensity',
+          title: 'Контроль интенсивности',
+          subtitle: 'Держать выбранную зону или диапазон пульса',
+          icon: Icons.favorite_border_rounded,
+        ),
+        const SizedBox(height: 8),
+        _modeCard(
+          keyName: 'interval',
+          title: 'Интервальная',
+          subtitle: 'Разминка, работа, восстановление и повторы',
+          icon: Icons.repeat_rounded,
+        ),
+        const SizedBox(height: 24),
+        _setupNextButton('Далее', () {
+          _goToSetupStep(2);
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _openWorkoutSettingsSheet();
+          });
+        }),
+      ],
+    );
+  }
+
+  Widget _modeCard({
+    required String keyName,
+    required String title,
+    required String subtitle,
+    required IconData icon,
+  }) {
+    return _setupChoiceCard(
+      title: title,
+      subtitle: subtitle,
+      icon: icon,
+      selected: _workoutMode == keyName,
+      onTap: () => setState(() => _workoutMode = keyName),
+    );
+  }
+
+  Widget _setupChoiceCard({
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+          decoration: BoxDecoration(
+            color: selected
+                ? _klsGold.withOpacity(0.07)
+                : const Color(0xFF091B2A),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: selected
+                  ? _klsGold.withOpacity(0.38)
+                  : const Color(0x14FFFFFF),
+              width: 0.7,
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                icon,
+                color: selected ? _klsGold : const Color(0xFF8A98A9),
+                size: 20,
+              ),
+              const SizedBox(width: 11),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontFamily: 'Montserrat',
+                        color: selected
+                            ? const Color(0xFFF5F7FA)
+                            : const Color(0xFFB6C0CB),
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    if (subtitle.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Text(
+                        subtitle,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: _mutedTextStyle(9.5),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (selected) ...[
+                const SizedBox(width: 8),
+                Container(
+                  width: 18,
+                  height: 18,
+                  decoration: const BoxDecoration(
+                    color: _klsGold,
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.check_rounded,
+                    color: Color(0xFF061522),
+                    size: 12,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _setupNextButton(String label, VoidCallback onPressed) {
+    return SizedBox(
+      width: double.infinity,
+      height: 50,
+      child: ElevatedButton(
+        onPressed: onPressed,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: _klsGold,
+          foregroundColor: const Color(0xFF061522),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          elevation: 0,
+        ),
+        child: Text(
+          label,
+          style: const TextStyle(
+            fontFamily: 'Montserrat',
+            fontSize: 13.5,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildPreparationScreen() {
     return Column(
       children: [
         _header(),
-        const SizedBox(height: 12),
+        const SizedBox(height: 20),
         if (_hasPlanContext) ...[
           _planContextCard(),
-          const SizedBox(height: 10),
+          const SizedBox(height: 16),
         ],
-        _sportSelector(),
-        const SizedBox(height: 10),
+        _workoutConfigurationCard(),
+        const SizedBox(height: 16),
         _connectionPanel(),
-        const SizedBox(height: 10),
+        const SizedBox(height: 16),
         Expanded(child: _mapCard()),
-        if (_errorText != null) ...[
-          const SizedBox(height: 8),
-          _errorBox(),
-        ],
-        const SizedBox(height: 10),
+        if (_errorText != null) ...[const SizedBox(height: 10), _errorBox()],
+        const SizedBox(height: 14),
         _startButton(),
       ],
     );
@@ -2049,71 +3267,111 @@ class _KlsGpsWorkoutRecorderWidgetState
     return Column(
       children: [
         _header(),
-        const SizedBox(height: 10),
+        const SizedBox(height: 14),
         _recordingStatusBar(),
-        if (showHeartRate) ...[
+        if (_workoutMode != 'free' || _freeGoalType != 'none') ...[
           const SizedBox(height: 8),
-          _liveHeartRateBar(),
+          _workoutGuidanceBar(),
         ],
-        const SizedBox(height: 10),
+        if (showHeartRate) ...[const SizedBox(height: 8), _liveHeartRateBar()],
+        const SizedBox(height: 14),
         _activeMetricsCard(),
-        const SizedBox(height: 10),
+        const SizedBox(height: 12),
         _activeMetricsRow(),
-        const SizedBox(height: 10),
+        const SizedBox(height: 14),
         Expanded(child: _mapCard()),
-        if (_laps.isNotEmpty) ...[
-          const SizedBox(height: 8),
-          _lastLapBar(),
-        ],
-        if (_errorText != null) ...[
-          const SizedBox(height: 8),
-          _errorBox(),
-        ],
-        const SizedBox(height: 10),
+        if (_laps.isNotEmpty) ...[const SizedBox(height: 8), _lastLapBar()],
+        if (_errorText != null) ...[const SizedBox(height: 8), _errorBox()],
+        const SizedBox(height: 12),
         _trackingControls(),
       ],
     );
   }
 
   Widget _header() {
+    final statusColor = _isPaused ? _klsGold : _klsGreen;
+
     return Row(
       children: [
         GestureDetector(
+          behavior: HitTestBehavior.opaque,
           onTap: _handleBackPressed,
-          child: _iconSurface(Icons.arrow_back_ios_new_rounded, size: 38),
+          child: _iconSurface(Icons.arrow_back_rounded, size: 40),
         ),
-        const SizedBox(width: 11),
+        const SizedBox(width: 12),
         Expanded(
-          child: Text(
-            _isTracking ? _selectedSport.title : 'Тренировка',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              fontFamily: 'Montserrat',
-              color: Colors.white,
-              fontSize: 20,
-              fontWeight: FontWeight.w600,
-            ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                _isTracking
+                    ? _selectedSport.title
+                    : _setupStep == 0
+                    ? 'Новая тренировка'
+                    : _setupStep == 1
+                    ? 'Режим тренировки'
+                    : 'Готовность',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontFamily: 'Montserrat',
+                  color: Color(0xFFF5F7FA),
+                  fontSize: 23,
+                  height: 1.05,
+                  fontWeight: FontWeight.w400,
+                  letterSpacing: -0.45,
+                ),
+              ),
+              if (_isTracking) ...[
+                const SizedBox(height: 3),
+                Text(
+                  _workoutModeTitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: Color(0xFF8A98A9),
+                    fontSize: 9,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
+              ],
+            ],
           ),
         ),
         if (_isTracking)
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
             decoration: BoxDecoration(
-              color: (_isPaused ? _klsGold : _klsGreen).withOpacity(0.10),
-              borderRadius: BorderRadius.circular(99),
+              color: statusColor.withOpacity(0.06),
+              borderRadius: BorderRadius.circular(999),
               border: Border.all(
-                color: (_isPaused ? _klsGold : _klsGreen).withOpacity(0.32),
+                color: statusColor.withOpacity(0.20),
+                width: 0.7,
               ),
             ),
-            child: Text(
-              _isPaused ? 'Пауза' : 'Запись',
-              style: TextStyle(
-                fontFamily: 'Montserrat',
-                color: _isPaused ? _klsGold : _klsGreen,
-                fontSize: 10.5,
-                fontWeight: FontWeight.w600,
-              ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 5,
+                  height: 5,
+                  decoration: BoxDecoration(
+                    color: statusColor,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  _isPaused ? 'Пауза' : 'Запись',
+                  style: TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: statusColor,
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
             ),
           ),
       ],
@@ -2128,29 +3386,21 @@ class _KlsGpsWorkoutRecorderWidgetState
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.fromLTRB(14, 13, 14, 13),
       decoration: BoxDecoration(
-        color: _klsGold.withOpacity(0.07),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: _klsGold.withOpacity(0.22)),
+        color: const Color(0xFF091B2A),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0x14FFFFFF), width: 0.7),
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            width: 36,
-            height: 36,
-            decoration: BoxDecoration(
-              color: _klsGold.withOpacity(0.12),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: const Icon(
-              Icons.assignment_turned_in_outlined,
-              color: _klsGold,
-              size: 19,
-            ),
+          const Icon(
+            Icons.assignment_turned_in_outlined,
+            color: _klsGold,
+            size: 18,
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 11),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -2160,50 +3410,47 @@ class _KlsGpsWorkoutRecorderWidgetState
                   style: TextStyle(
                     fontFamily: 'Montserrat',
                     color: _klsGold,
-                    fontSize: 8.5,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.5,
+                    fontSize: 8,
+                    fontWeight: FontWeight.w500,
+                    letterSpacing: 0.75,
                   ),
                 ),
-                const SizedBox(height: 3),
+                const SizedBox(height: 5),
                 Text(
                   title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     fontFamily: 'Montserrat',
-                    color: Colors.white,
+                    color: Color(0xFFF5F7FA),
                     fontSize: 13,
-                    fontWeight: FontWeight.w600,
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
                 if (description.isNotEmpty) ...[
-                  const SizedBox(height: 3),
+                  const SizedBox(height: 4),
                   Text(
                     description,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontFamily: 'Montserrat',
-                      color: Colors.white.withOpacity(0.54),
-                      fontSize: 9.5,
-                      height: 1.35,
-                    ),
+                    style: _mutedTextStyle(9.5),
                   ),
                 ],
               ],
             ),
           ),
-          if ((widget.plannedDurationMinutes ?? 0) > 0)
+          if ((widget.plannedDurationMinutes ?? 0) > 0) ...[
+            const SizedBox(width: 10),
             Text(
               '${widget.plannedDurationMinutes} мин',
               style: const TextStyle(
                 fontFamily: 'Montserrat',
-                color: _klsGold,
-                fontSize: 10,
-                fontWeight: FontWeight.w600,
+                color: Color(0xFFAAB6C5),
+                fontSize: 9.5,
+                fontWeight: FontWeight.w500,
               ),
             ),
+          ],
         ],
       ),
     );
@@ -2233,9 +3480,7 @@ class _KlsGpsWorkoutRecorderWidgetState
                     ? _klsGold.withOpacity(0.12)
                     : Colors.white.withOpacity(0.045),
                 border: Border.all(
-                  color: selected
-                      ? _klsGold
-                      : Colors.white.withOpacity(0.08),
+                  color: selected ? _klsGold : Colors.white.withOpacity(0.08),
                   width: selected ? 1.2 : 1,
                 ),
               ),
@@ -2244,9 +3489,7 @@ class _KlsGpsWorkoutRecorderWidgetState
                 children: [
                   Icon(
                     sport.icon,
-                    color: selected
-                        ? _klsGold
-                        : Colors.white.withOpacity(0.45),
+                    color: selected ? _klsGold : Colors.white.withOpacity(0.45),
                     size: 19,
                   ),
                   const SizedBox(width: 6),
@@ -2261,7 +3504,7 @@ class _KlsGpsWorkoutRecorderWidgetState
                             ? _klsGold
                             : Colors.white.withOpacity(0.58),
                         fontSize: 10.5,
-                        fontWeight: FontWeight.w600,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
                   ),
@@ -2274,107 +3517,777 @@ class _KlsGpsWorkoutRecorderWidgetState
     );
   }
 
+  String get _workoutConfigurationSummary {
+    if (_workoutMode == 'intensity') {
+      if (_intensityUsesManualRange) {
+        return '$_manualTargetMin–$_manualTargetMax уд/мин';
+      }
+      final bounds = _zoneBounds(_intensityTargetZone, _profileHeartRateZones);
+      return bounds == null
+          ? 'Выберите диапазон пульса'
+          : 'Z$_intensityTargetZone · ${bounds[0]}–${bounds[1]} уд/мин';
+    }
+    if (_workoutMode == 'interval') {
+      return '$_intervalWarmupMinutes мин → $_intervalRepeats × '
+          '($_intervalWorkMinutes/$_intervalRecoveryMinutes мин) → '
+          '$_intervalCooldownMinutes мин';
+    }
+    switch (_freeGoalType) {
+      case 'time':
+        return 'Цель · $_freeGoalMinutes мин';
+      case 'distance':
+        return 'Цель · ${_freeGoalDistanceKm.toStringAsFixed(1).replaceAll('.', ',')} км';
+      default:
+        return 'Без цели';
+    }
+  }
+
+  Widget _workoutConfigurationCard() {
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        onTap: _isStarting ? null : _openWorkoutSettingsSheet,
+        borderRadius: BorderRadius.circular(16),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF091B2A),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: const Color(0x14FFFFFF), width: 0.7),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                _workoutMode == 'interval'
+                    ? Icons.repeat_rounded
+                    : _workoutMode == 'intensity'
+                    ? Icons.favorite_border_rounded
+                    : Icons.route_outlined,
+                color: _klsGold,
+                size: 18,
+              ),
+              const SizedBox(width: 11),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${_selectedSport.title} · $_workoutModeTitle',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontFamily: 'Montserrat',
+                        color: Color(0xFFF5F7FA),
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _workoutConfigurationSummary,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: _mutedTextStyle(9.2),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 10),
+              const _KlsGpsLongArrow(),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openWorkoutSettingsSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            void change(VoidCallback action) {
+              if (mounted) setState(action);
+              setSheetState(() {});
+            }
+
+            return FractionallySizedBox(
+              heightFactor: 0.86,
+              child: Container(
+                decoration: const BoxDecoration(
+                  color: _klsNavy,
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                  border: Border(
+                    top: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+                  ),
+                ),
+                child: SafeArea(
+                  top: false,
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 10),
+                      Container(
+                        width: 34,
+                        height: 3,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF8A98A9).withOpacity(0.28),
+                          borderRadius: BorderRadius.circular(99),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(18, 16, 14, 10),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    _workoutModeTitle,
+                                    style: const TextStyle(
+                                      fontFamily: 'Montserrat',
+                                      color: Color(0xFFF5F7FA),
+                                      fontSize: 19,
+                                      fontWeight: FontWeight.w500,
+                                      letterSpacing: -0.2,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  const Text(
+                                    'Настройте тренировку перед стартом',
+                                    style: TextStyle(
+                                      fontFamily: 'Montserrat',
+                                      color: Color(0xFF8A98A9),
+                                      fontSize: 9.5,
+                                      fontWeight: FontWeight.w400,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Material(
+                              color: Colors.transparent,
+                              shape: const CircleBorder(),
+                              child: InkWell(
+                                customBorder: const CircleBorder(),
+                                onTap: () => Navigator.pop(sheetContext),
+                                child: const SizedBox(
+                                  width: 40,
+                                  height: 40,
+                                  child: Icon(
+                                    Icons.close_rounded,
+                                    color: Color(0xFFAAB6C5),
+                                    size: 19,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(18, 0, 18, 8),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          decoration: const BoxDecoration(
+                            border: Border(
+                              top: BorderSide(
+                                color: Color(0x14FFFFFF),
+                                width: 0.7,
+                              ),
+                              bottom: BorderSide(
+                                color: Color(0x14FFFFFF),
+                                width: 0.7,
+                              ),
+                            ),
+                          ),
+                          child: SwitchListTile.adaptive(
+                            contentPadding: EdgeInsets.zero,
+                            activeColor: _klsGold,
+                            title: const Text(
+                              'Голосовые подсказки',
+                              style: TextStyle(
+                                fontFamily: 'Montserrat',
+                                color: Color(0xFFF5F7FA),
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                            subtitle: const Text(
+                              'Этапы, цели и контроль пульса без телефона в руках',
+                              style: TextStyle(
+                                fontFamily: 'Montserrat',
+                                color: Color(0xFF8A98A9),
+                                fontSize: 8.5,
+                                height: 1.3,
+                              ),
+                            ),
+                            value: _voiceEnabled,
+                            onChanged: (value) =>
+                                change(() => _voiceEnabled = value),
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: SingleChildScrollView(
+                          padding: const EdgeInsets.fromLTRB(18, 12, 18, 24),
+                          child: _workoutMode == 'free'
+                              ? _freeSettings(change)
+                              : _workoutMode == 'intensity'
+                              ? _intensitySettings(change)
+                              : _intervalSettings(change),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(18, 8, 18, 18),
+                        child: _setupNextButton(
+                          'Готово',
+                          () => Navigator.pop(sheetContext),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    if (mounted) setState(() {});
+  }
+
+  Widget _settingsTitle(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 11),
+      child: Text(
+        text.toUpperCase(),
+        style: const TextStyle(
+          fontFamily: 'Montserrat',
+          color: Color(0xFF8A98A9),
+          fontSize: 8.5,
+          fontWeight: FontWeight.w500,
+          letterSpacing: 0.75,
+        ),
+      ),
+    );
+  }
+
+  Widget _freeSettings(void Function(VoidCallback) change) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _settingsTitle('Цель тренировки'),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _settingsChip(
+              'Без цели',
+              _freeGoalType == 'none',
+              () => change(() => _freeGoalType = 'none'),
+            ),
+            _settingsChip(
+              'По времени',
+              _freeGoalType == 'time',
+              () => change(() => _freeGoalType = 'time'),
+            ),
+            _settingsChip(
+              'По расстоянию',
+              _freeGoalType == 'distance',
+              () => change(() => _freeGoalType = 'distance'),
+            ),
+          ],
+        ),
+        if (_freeGoalType == 'time') ...[
+          const SizedBox(height: 16),
+          _settingsStepper(
+            label: 'Продолжительность',
+            value: '$_freeGoalMinutes мин',
+            onMinus: () =>
+                change(() => _freeGoalMinutes = max(5, _freeGoalMinutes - 5)),
+            onPlus: () => change(
+              () => _freeGoalMinutes = min(1440, _freeGoalMinutes + 5),
+            ),
+          ),
+        ],
+        if (_freeGoalType == 'distance') ...[
+          const SizedBox(height: 16),
+          _settingsStepper(
+            label: 'Расстояние',
+            value:
+                '${_freeGoalDistanceKm.toStringAsFixed(1).replaceAll('.', ',')} км',
+            onMinus: () => change(
+              () => _freeGoalDistanceKm = max(0.5, _freeGoalDistanceKm - 0.5),
+            ),
+            onPlus: () => change(
+              () =>
+                  _freeGoalDistanceKm = min(1000.0, _freeGoalDistanceKm + 0.5),
+            ),
+          ),
+        ],
+        const SizedBox(height: 20),
+        _settingsTitle('Аудиосводка'),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            _settingsChip(
+              'Каждые 10 минут',
+              _audioSummaryType == '10_min',
+              () => change(() => _audioSummaryType = '10_min'),
+            ),
+            _settingsChip(
+              'Каждый 1 км',
+              _audioSummaryType == '1_km',
+              () => change(() => _audioSummaryType = '1_km'),
+            ),
+            _settingsChip(
+              'Каждые 5 км',
+              _audioSummaryType == '5_km',
+              () => change(() => _audioSummaryType = '5_km'),
+            ),
+            _settingsChip(
+              'Не сообщать',
+              _audioSummaryType == 'off',
+              () => change(() => _audioSummaryType = 'off'),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _intensitySettings(void Function(VoidCallback) change) {
+    final zones = _profileHeartRateZones;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _settingsTitle('Целевая интенсивность'),
+        if (_isLoadingHeartRateZones)
+          const Center(child: CircularProgressIndicator(color: _klsGold))
+        else ...[
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _settingsChip(
+                'Мои зоны',
+                !_intensityUsesManualRange,
+                zones == null
+                    ? null
+                    : () => change(() => _intensityUsesManualRange = false),
+              ),
+              _settingsChip(
+                'Ручной диапазон',
+                _intensityUsesManualRange,
+                () => change(() => _intensityUsesManualRange = true),
+              ),
+            ],
+          ),
+          if (!_intensityUsesManualRange && zones != null) ...[
+            const SizedBox(height: 16),
+            _zoneSelector(
+              selectedZone: _intensityTargetZone,
+              zones: zones,
+              onChanged: (zone) => change(() => _intensityTargetZone = zone),
+            ),
+          ] else ...[
+            const SizedBox(height: 16),
+            if (zones == null && _heartRateZonesError != null) ...[
+              Text(_heartRateZonesError!, style: _mutedTextStyle(10)),
+              const SizedBox(height: 10),
+            ],
+            _settingsStepper(
+              label: 'Нижняя граница',
+              value: '$_manualTargetMin уд/мин',
+              onMinus: () => change(
+                () => _manualTargetMin = max(40, _manualTargetMin - 1),
+              ),
+              onPlus: () => change(
+                () => _manualTargetMin = min(
+                  _manualTargetMax - 1,
+                  _manualTargetMin + 1,
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            _settingsStepper(
+              label: 'Верхняя граница',
+              value: '$_manualTargetMax уд/мин',
+              onMinus: () => change(
+                () => _manualTargetMax = max(
+                  _manualTargetMin + 1,
+                  _manualTargetMax - 1,
+                ),
+              ),
+              onPlus: () => change(
+                () => _manualTargetMax = min(240, _manualTargetMax + 1),
+              ),
+            ),
+          ],
+        ],
+        const SizedBox(height: 16),
+        Text(
+          'Предупреждение появится после 20 секунд устойчивого выхода из диапазона.',
+          style: _mutedTextStyle(9.5),
+        ),
+      ],
+    );
+  }
+
+  Widget _intervalSettings(void Function(VoidCallback) change) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _settingsTitle('Структура тренировки'),
+        _settingsStepper(
+          label: 'Разминка',
+          value: '$_intervalWarmupMinutes мин',
+          onMinus: () => change(
+            () => _intervalWarmupMinutes = max(0, _intervalWarmupMinutes - 1),
+          ),
+          onPlus: () => change(
+            () => _intervalWarmupMinutes = min(180, _intervalWarmupMinutes + 1),
+          ),
+        ),
+        const SizedBox(height: 10),
+        _settingsStepper(
+          label: 'Работа',
+          value: '$_intervalWorkMinutes мин',
+          onMinus: () => change(
+            () => _intervalWorkMinutes = max(1, _intervalWorkMinutes - 1),
+          ),
+          onPlus: () => change(
+            () => _intervalWorkMinutes = min(180, _intervalWorkMinutes + 1),
+          ),
+        ),
+        const SizedBox(height: 10),
+        _settingsStepper(
+          label: 'Восстановление',
+          value: '$_intervalRecoveryMinutes мин',
+          onMinus: () => change(
+            () =>
+                _intervalRecoveryMinutes = max(0, _intervalRecoveryMinutes - 1),
+          ),
+          onPlus: () => change(
+            () => _intervalRecoveryMinutes = min(
+              180,
+              _intervalRecoveryMinutes + 1,
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        _settingsStepper(
+          label: 'Повторы',
+          value: '$_intervalRepeats',
+          onMinus: () =>
+              change(() => _intervalRepeats = max(1, _intervalRepeats - 1)),
+          onPlus: () =>
+              change(() => _intervalRepeats = min(50, _intervalRepeats + 1)),
+        ),
+        const SizedBox(height: 10),
+        _settingsStepper(
+          label: 'Заминка',
+          value: '$_intervalCooldownMinutes мин',
+          onMinus: () => change(
+            () =>
+                _intervalCooldownMinutes = max(0, _intervalCooldownMinutes - 1),
+          ),
+          onPlus: () => change(
+            () => _intervalCooldownMinutes = min(
+              180,
+              _intervalCooldownMinutes + 1,
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: _surfaceDecoration(radius: 16),
+          child: SwitchListTile.adaptive(
+            contentPadding: EdgeInsets.zero,
+            activeColor: _klsGold,
+            title: const Text(
+              'Контроль пульса на работе',
+              style: TextStyle(
+                fontFamily: 'Montserrat',
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            value: _intervalUsesHeartRate,
+            onChanged: _profileHeartRateZones == null
+                ? null
+                : (value) => change(() => _intervalUsesHeartRate = value),
+          ),
+        ),
+        if (_intervalUsesHeartRate && _profileHeartRateZones != null) ...[
+          const SizedBox(height: 14),
+          _zoneSelector(
+            selectedZone: _intervalTargetZone,
+            zones: _profileHeartRateZones!,
+            onChanged: (zone) => change(() => _intervalTargetZone = zone),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _zoneSelector({
+    required int selectedZone,
+    required _HeartRateZones zones,
+    required ValueChanged<int> onChanged,
+  }) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: List.generate(5, (index) {
+        final zone = index + 1;
+        final bounds = _zoneBounds(zone, zones)!;
+        return _settingsChip(
+          'Z$zone · ${bounds[0]}–${bounds[1]}',
+          selectedZone == zone,
+          () => onChanged(zone),
+        );
+      }),
+    );
+  }
+
+  Widget _settingsChip(String label, bool selected, VoidCallback? onTap) {
+    final disabled = onTap == null;
+
+    final backgroundColor = disabled
+        ? const Color(0xFF081722)
+        : selected
+        ? const Color(0xFF1A2B34)
+        : const Color(0xFF091B2A);
+
+    final borderColor = disabled
+        ? const Color(0x0FFFFFFF)
+        : selected
+        ? _klsGold.withOpacity(0.48)
+        : const Color(0x14FFFFFF);
+
+    final textColor = disabled
+        ? const Color(0xFF566475)
+        : selected
+        ? _klsGold
+        : const Color(0xFFAAB6C5);
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(999),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(999),
+        splashColor: _klsGold.withOpacity(0.05),
+        highlightColor: _klsGold.withOpacity(0.025),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          curve: Curves.easeOutCubic,
+          constraints: const BoxConstraints(minHeight: 38),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: backgroundColor,
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: borderColor,
+              width: selected && !disabled ? 0.9 : 0.7,
+            ),
+          ),
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontFamily: 'Montserrat',
+              color: textColor,
+              fontSize: 9.5,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _settingsStepper({
+    required String label,
+    required String value,
+    required VoidCallback onMinus,
+    required VoidCallback onPlus,
+  }) {
+    return Container(
+      height: 52,
+      padding: const EdgeInsets.only(left: 12, right: 5),
+      decoration: BoxDecoration(
+        color: const Color(0xFF091B2A),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0x14FFFFFF), width: 0.7),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(
+                fontFamily: 'Montserrat',
+                color: Color(0xFFB5C0CC),
+                fontSize: 10.5,
+                fontWeight: FontWeight.w400,
+              ),
+            ),
+          ),
+          _settingsStepButton(Icons.remove_rounded, onMinus),
+          SizedBox(
+            width: 86,
+            child: Text(
+              value,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontFamily: 'Montserrat',
+                color: Color(0xFFF5F7FA),
+                fontSize: 10.5,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+          _settingsStepButton(Icons.add_rounded, onPlus),
+        ],
+      ),
+    );
+  }
+
+  Widget _settingsStepButton(IconData icon, VoidCallback onTap) {
+    return Material(
+      color: Colors.transparent,
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: const Color(0x18FFFFFF), width: 0.7),
+          ),
+          child: Icon(icon, color: _klsGold, size: 17),
+        ),
+      ),
+    );
+  }
+
   Widget _connectionPanel() {
     final connected = _heartRateConnected;
     final bpm = _currentHeartRateBpm;
     final pulseStatus = connected
         ? bpm != null
-            ? '$bpm уд/мин'
-            : 'Подключено'
+              ? '$bpm уд/мин'
+              : 'Подключено'
         : 'Подключить';
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: _surfaceDecoration(radius: 18),
+      decoration: const BoxDecoration(
+        border: Border(
+          top: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+          bottom: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+        ),
+      ),
       child: Column(
         children: [
-          Row(
-            children: [
-              Icon(
-                _gpsReadyForStart
-                    ? Icons.gps_fixed_rounded
-                    : Icons.gps_not_fixed_rounded,
-                color: _gpsStatusColor,
-                size: 18,
-              ),
-              const SizedBox(width: 9),
-              const Expanded(
-                child: Text(
-                  'GPS',
-                  style: TextStyle(
-                    fontFamily: 'Montserrat',
-                    color: Colors.white,
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w600,
+          SizedBox(
+            height: 48,
+            child: Row(
+              children: [
+                Icon(
+                  _gpsReadyForStart
+                      ? Icons.gps_fixed_rounded
+                      : Icons.gps_not_fixed_rounded,
+                  color: _gpsStatusColor,
+                  size: 17,
+                ),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text(
+                    'GPS',
+                    style: TextStyle(
+                      fontFamily: 'Montserrat',
+                      color: Color(0xFFF5F7FA),
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ),
-              ),
-              Flexible(
-                child: Text(
-                  _gpsStatus,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.right,
-                  style: TextStyle(
-                    fontFamily: 'Montserrat',
-                    color: _gpsStatusColor,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w600,
+                Flexible(
+                  child: Text(
+                    _gpsStatus,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.right,
+                    style: TextStyle(
+                      fontFamily: 'Montserrat',
+                      color: _gpsStatusColor,
+                      fontSize: 9.5,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
-          const SizedBox(height: 9),
-          Container(height: 1, color: Colors.white.withOpacity(0.06)),
-          const SizedBox(height: 4),
+          const Divider(height: 0.7, thickness: 0.7, color: Color(0x14FFFFFF)),
           Material(
             color: Colors.transparent,
             child: InkWell(
               onTap: _openHeartRateDevice,
-              borderRadius: BorderRadius.circular(14),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 7),
+              child: SizedBox(
+                height: 52,
                 child: Row(
                   children: [
                     Icon(
                       connected
                           ? Icons.favorite_rounded
                           : Icons.favorite_border_rounded,
-                      color: connected
-                          ? _klsGreen
-                          : Colors.white.withOpacity(0.42),
-                      size: 18,
+                      color: connected ? _klsGreen : const Color(0xFF8A98A9),
+                      size: 17,
                     ),
-                    const SizedBox(width: 9),
+                    const SizedBox(width: 10),
                     Expanded(
                       child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           const Text(
                             'Пульсометр',
                             style: TextStyle(
                               fontFamily: 'Montserrat',
-                              color: Colors.white,
+                              color: Color(0xFFF5F7FA),
                               fontSize: 11.5,
-                              fontWeight: FontWeight.w600,
+                              fontWeight: FontWeight.w500,
                             ),
                           ),
-                          if (connected)
-                            Padding(
-                              padding: const EdgeInsets.only(top: 2),
-                              child: Text(
-                                _heartRateDeviceName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontFamily: 'Montserrat',
-                                  color: Colors.white.withOpacity(0.40),
-                                  fontSize: 8.5,
-                                ),
+                          if (connected) ...[
+                            const SizedBox(height: 2),
+                            Text(
+                              _heartRateDeviceName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontFamily: 'Montserrat',
+                                color: Color(0xFF8A98A9),
+                                fontSize: 8.5,
                               ),
                             ),
+                          ],
                         ],
                       ),
                     ),
@@ -2383,15 +4296,13 @@ class _KlsGpsWorkoutRecorderWidgetState
                       style: TextStyle(
                         fontFamily: 'Montserrat',
                         color: connected ? _klsGreen : _klsGold,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w600,
+                        fontSize: 9.5,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
-                    const SizedBox(width: 4),
-                    Icon(
-                      Icons.chevron_right_rounded,
-                      color: Colors.white.withOpacity(0.28),
-                      size: 18,
+                    const SizedBox(width: 9),
+                    _KlsGpsLongArrow(
+                      color: connected ? const Color(0xFF8A98A9) : _klsGold,
                     ),
                   ],
                 ),
@@ -2404,44 +4315,139 @@ class _KlsGpsWorkoutRecorderWidgetState
   }
 
   Widget _recordingStatusBar() {
+    return Row(
+      children: [
+        Container(
+          width: 6,
+          height: 6,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: _gpsStatusColor,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            _gpsStatus,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontFamily: 'Montserrat',
+              color: _gpsStatusColor,
+              fontSize: 9.5,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+        if (_currentAltitudeMeters != null)
+          Text(
+            '${_currentAltitudeMeters!.round()} м',
+            style: const TextStyle(
+              fontFamily: 'Montserrat',
+              color: Color(0xFF8A98A9),
+              fontSize: 9,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _workoutGuidanceBar() {
+    var title = _workoutModeTitle;
+    var detail = '';
+    var color = _klsGold;
+
+    if (_workoutMode == 'interval') {
+      final stage = _intervalStageAt(_elapsedSeconds);
+      title = stage.title;
+      detail = stage.finished
+          ? 'Можно завершить тренировку'
+          : 'Осталось ${_formatDuration(stage.remainingSeconds)}';
+      color = stage.key == 'work'
+          ? _klsRed
+          : stage.key == 'recovery'
+          ? _klsGreen
+          : _klsGold;
+    } else if (_workoutMode == 'intensity') {
+      final bounds = _targetBoundsForCurrentMoment();
+      title = bounds == null
+          ? 'Ожидаем целевой диапазон'
+          : 'Цель · ${bounds[0]}–${bounds[1]} уд/мин';
+      switch (_targetStatus) {
+        case 'below':
+          detail = 'Пульс ниже целевого диапазона';
+          color = _klsIce;
+          break;
+        case 'above':
+          detail = 'Пульс выше целевого диапазона';
+          color = _klsRed;
+          break;
+        case 'inside':
+          detail = 'Целевая интенсивность';
+          color = _klsGreen;
+          break;
+        default:
+          detail = 'Контроль начнётся после получения пульса';
+      }
+    } else if (_freeGoalType == 'time') {
+      final remaining = max(0, _freeGoalMinutes * 60 - _elapsedSeconds);
+      title = 'Цель · $_freeGoalMinutes мин';
+      detail = remaining == 0
+          ? 'Цель выполнена'
+          : 'Осталось ${_formatDuration(remaining)}';
+      color = remaining == 0 ? _klsGreen : _klsGold;
+    } else if (_freeGoalType == 'distance') {
+      final remaining = max(0.0, _freeGoalDistanceKm - _distanceMeters / 1000);
+      title = 'Цель · ${_freeGoalDistanceKm.toStringAsFixed(1)} км';
+      detail = remaining <= 0
+          ? 'Цель выполнена'
+          : 'Осталось ${remaining.toStringAsFixed(1).replaceAll('.', ',')} км';
+      color = remaining <= 0 ? _klsGreen : _klsGold;
+    }
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
       decoration: BoxDecoration(
-        color: _gpsStatusColor.withOpacity(0.07),
-        borderRadius: BorderRadius.circular(15),
-        border: Border.all(color: _gpsStatusColor.withOpacity(0.20)),
+        color: color.withOpacity(0.045),
+        borderRadius: BorderRadius.circular(13),
+        border: Border.all(color: color.withOpacity(0.14), width: 0.7),
       ),
       child: Row(
         children: [
           Icon(
-            _gpsLocked ? Icons.gps_fixed_rounded : Icons.gps_not_fixed_rounded,
+            _workoutMode == 'interval'
+                ? Icons.repeat_rounded
+                : Icons.track_changes_outlined,
+            color: color,
             size: 15,
-            color: _gpsStatusColor,
           ),
-          const SizedBox(width: 7),
+          const SizedBox(width: 8),
           Expanded(
-            child: Text(
-              _gpsStatus,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontFamily: 'Montserrat',
-                color: _gpsStatusColor,
-                fontSize: 10,
-                fontWeight: FontWeight.w600,
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: color,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  detail,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: _mutedTextStyle(8.5),
+                ),
+              ],
             ),
           ),
-          if (_currentAltitudeMeters != null)
-            Text(
-              '${_currentAltitudeMeters!.round()} м над ур. моря',
-              style: TextStyle(
-                fontFamily: 'Montserrat',
-                color: Colors.white.withOpacity(0.46),
-                fontSize: 9,
-              ),
-            ),
         ],
       ),
     );
@@ -2451,156 +4457,167 @@ class _KlsGpsWorkoutRecorderWidgetState
     final bpm = _currentHeartRateBpm;
     if (!_heartRateConnected || bpm == null) return const SizedBox.shrink();
 
-    final avg = KlsHeartRateDeviceWidget.workoutAverageBpm;
-    final maxBpm = KlsHeartRateDeviceWidget.workoutMaxBpm;
+    final avg = _coachHeartRateSampleCount > 0
+        ? (_coachHeartRateSum / _coachHeartRateSampleCount).round()
+        : null;
+    final maxBpm = _coachHeartRateSampleCount > 0 ? _coachHeartRateMax : null;
+    final currentZone = _zoneForBpm(bpm);
 
-    return GestureDetector(
-      onTap: _openHeartRateDevice,
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: _klsRed.withOpacity(0.06),
-          borderRadius: BorderRadius.circular(15),
-          border: Border.all(color: _klsRed.withOpacity(0.16)),
-        ),
-        child: Row(
-          children: [
-            const Icon(Icons.favorite_rounded, color: _klsRed, size: 17),
-            const SizedBox(width: 8),
-            Text(
-              '$bpm',
-              style: const TextStyle(
-                fontFamily: 'Montserrat',
-                color: Colors.white,
-                fontSize: 17,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-            const SizedBox(width: 4),
-            Text(
-              'уд/мин',
-              style: TextStyle(
-                fontFamily: 'Montserrat',
-                color: Colors.white.withOpacity(0.44),
-                fontSize: 9,
-              ),
-            ),
-            const Spacer(),
-            if (avg != null)
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(13),
+      child: InkWell(
+        onTap: _openHeartRateDevice,
+        borderRadius: BorderRadius.circular(13),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+          decoration: BoxDecoration(
+            color: _klsRed.withOpacity(0.04),
+            borderRadius: BorderRadius.circular(13),
+            border: Border.all(color: _klsRed.withOpacity(0.12), width: 0.7),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.favorite_rounded, color: _klsRed, size: 15),
+              const SizedBox(width: 8),
               Text(
-                'ср. $avg',
-                style: TextStyle(
+                '$bpm',
+                style: const TextStyle(
                   fontFamily: 'Montserrat',
-                  color: Colors.white.withOpacity(0.52),
-                  fontSize: 9,
-                  fontWeight: FontWeight.w600,
+                  color: Color(0xFFF5F7FA),
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
                 ),
               ),
-            if (avg != null && maxBpm != null)
-              Text('  ·  ', style: TextStyle(color: Colors.white.withOpacity(0.20))),
-            if (maxBpm != null)
-              Text(
-                'макс. $maxBpm',
+              const SizedBox(width: 4),
+              const Text(
+                'уд/мин',
                 style: TextStyle(
                   fontFamily: 'Montserrat',
-                  color: Colors.white.withOpacity(0.52),
-                  fontSize: 9,
-                  fontWeight: FontWeight.w600,
+                  color: Color(0xFF8A98A9),
+                  fontSize: 8.5,
                 ),
               ),
-            const SizedBox(width: 5),
-            Icon(
-              Icons.chevron_right_rounded,
-              color: Colors.white.withOpacity(0.26),
-              size: 16,
-            ),
-          ],
+              if (currentZone != null) ...[
+                const SizedBox(width: 7),
+                Text(
+                  'Z$currentZone',
+                  style: const TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: _klsGold,
+                    fontSize: 8.5,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+              const Spacer(),
+              if (avg != null)
+                Text(
+                  'ср. $avg',
+                  style: const TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: Color(0xFF8A98A9),
+                    fontSize: 8.5,
+                  ),
+                ),
+              if (avg != null && maxBpm != null)
+                const Text('  ·  ', style: TextStyle(color: Color(0x448A98A9))),
+              if (maxBpm != null)
+                Text(
+                  'макс. $maxBpm',
+                  style: const TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: Color(0xFF8A98A9),
+                    fontSize: 8.5,
+                  ),
+                ),
+              const SizedBox(width: 8),
+              const _KlsGpsLongArrow(color: Color(0xFF8A98A9)),
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _activeMetricsCard() {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(24),
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
-        child: Container(
-          width: double.infinity,
-          padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
-          decoration: _surfaceDecoration(radius: 24),
-          child: Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 9),
+      decoration: const BoxDecoration(
+        border: Border(
+          top: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+          bottom: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+        ),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('ВРЕМЯ', style: _metricLabel()),
+                const SizedBox(height: 5),
+                Text(
+                  _formatDuration(_elapsedSeconds),
+                  style: const TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: Color(0xFFF5F7FA),
+                    fontSize: 34,
+                    height: 1,
+                    fontWeight: FontWeight.w400,
+                    letterSpacing: -0.9,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Container(width: 0.7, height: 54, color: const Color(0x14FFFFFF)),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('ДИСТАНЦИЯ', style: _metricLabel()),
+                const SizedBox(height: 5),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
                   children: [
-                    Text('ВРЕМЯ', style: _metricLabel()),
-                    const SizedBox(height: 3),
-                    Text(
-                      _formatDuration(_elapsedSeconds),
-                      style: const TextStyle(
-                        fontFamily: 'Montserrat',
-                        color: Colors.white,
-                        fontSize: 32,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: -0.7,
+                    Flexible(
+                      child: Text(
+                        _formatDistancePrimary(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontFamily: 'Montserrat',
+                          color: _klsGold,
+                          fontSize: 34,
+                          height: 1,
+                          fontWeight: FontWeight.w400,
+                          letterSpacing: -0.9,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    const Padding(
+                      padding: EdgeInsets.only(bottom: 3),
+                      child: Text(
+                        'км',
+                        style: TextStyle(
+                          fontFamily: 'Montserrat',
+                          color: _klsGold,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w500,
+                        ),
                       ),
                     ),
                   ],
                 ),
-              ),
-              Container(
-                width: 1,
-                height: 58,
-                color: Colors.white.withOpacity(0.08),
-              ),
-              const SizedBox(width: 15),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('ДИСТАНЦИЯ', style: _metricLabel()),
-                    const SizedBox(height: 3),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Flexible(
-                          child: Text(
-                            _formatDistancePrimary(),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontFamily: 'Montserrat',
-                              color: _klsGold,
-                              fontSize: 32,
-                              fontWeight: FontWeight.w700,
-                              letterSpacing: -0.7,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 4),
-                        const Padding(
-                          padding: EdgeInsets.only(bottom: 4),
-                          child: Text(
-                            'км',
-                            style: TextStyle(
-                              fontFamily: 'Montserrat',
-                              color: _klsGold,
-                              fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
+        ],
       ),
     );
   }
@@ -2677,22 +4694,26 @@ class _KlsGpsWorkoutRecorderWidgetState
     String? footer,
   }) {
     return Container(
-      height: 82,
-      padding: const EdgeInsets.all(10),
-      decoration: _surfaceDecoration(radius: 17),
+      height: 68,
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF091B2A),
+        borderRadius: BorderRadius.circular(13),
+        border: Border.all(color: const Color(0x14FFFFFF), width: 0.7),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(icon, color: _klsGold, size: 14),
+              Icon(icon, color: const Color(0xFF8A98A9), size: 12),
               const SizedBox(width: 5),
               Expanded(
                 child: Text(
                   label,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: _mutedTextStyle(9),
+                  style: _mutedTextStyle(8.2),
                 ),
               ),
             ],
@@ -2703,21 +4724,21 @@ class _KlsGpsWorkoutRecorderWidgetState
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(
-              color: Colors.white,
+              color: Color(0xFFF5F7FA),
               fontFamily: 'Montserrat',
-              fontSize: 14,
-              fontWeight: FontWeight.w700,
-              letterSpacing: -0.2,
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+              letterSpacing: -0.15,
             ),
           ),
           if (footer != null) ...[
-            const SizedBox(height: 2),
+            const SizedBox(height: 1),
             Text(
               footer,
-              style: TextStyle(
-                color: Colors.white.withOpacity(0.32),
+              style: const TextStyle(
+                color: Color(0xFF667587),
                 fontFamily: 'Montserrat',
-                fontSize: 7.8,
+                fontSize: 7.2,
               ),
             ),
           ],
@@ -2730,12 +4751,12 @@ class _KlsGpsWorkoutRecorderWidgetState
     return Container(
       width: double.infinity,
       decoration: BoxDecoration(
-        color: const Color(0xFF07182D),
-        borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: Colors.white.withOpacity(0.09)),
+        color: const Color(0xFF091B2A),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0x14FFFFFF), width: 0.7),
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(22),
+        borderRadius: BorderRadius.circular(18),
         child: Stack(
           children: [
             Positioned.fill(
@@ -2749,8 +4770,9 @@ class _KlsGpsWorkoutRecorderWidgetState
                         _currentPosition!.longitude,
                       ),
                 accuracyMeters: _accuracy,
-                headingDegrees:
-                    _hasMovementBearing ? _movementBearingDegrees : _heading,
+                headingDegrees: _hasMovementBearing
+                    ? _movementBearingDegrees
+                    : _heading,
                 fitWholeRoute: false,
                 showFinishMarker: false,
                 onReady: () {
@@ -2794,22 +4816,28 @@ class _KlsGpsWorkoutRecorderWidgetState
               Center(
                 child: Container(
                   margin: const EdgeInsets.symmetric(horizontal: 28),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 10,
+                  ),
                   decoration: BoxDecoration(
-                    color: const Color(0xDD061326),
-                    borderRadius: BorderRadius.circular(16),
+                    color: const Color(0xEE061522),
+                    borderRadius: BorderRadius.circular(13),
+                    border: Border.all(
+                      color: const Color(0x14FFFFFF),
+                      width: 0.7,
+                    ),
                   ),
                   child: Text(
                     _isLocating
                         ? 'Определяем ваше местоположение…'
                         : 'Включите геолокацию и точный доступ к GPS',
                     textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: Colors.white.withOpacity(0.78),
+                    style: const TextStyle(
+                      color: Color(0xFFB5C0CC),
                       fontFamily: 'Montserrat',
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w600,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w400,
                     ),
                   ),
                 ),
@@ -2822,43 +4850,50 @@ class _KlsGpsWorkoutRecorderWidgetState
 
   Widget _lastLapBar() {
     final lap = _laps.last;
-    return GestureDetector(
-      onTap: _showLapsSheet,
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
-        decoration: BoxDecoration(
-          color: _klsGold.withOpacity(0.07),
-          borderRadius: BorderRadius.circular(15),
-          border: Border.all(color: _klsGold.withOpacity(0.18)),
-        ),
-        child: Row(
-          children: [
-            const Icon(Icons.flag_outlined, color: _klsGold, size: 16),
-            const SizedBox(width: 7),
-            Text(
-              'Круг ${lap.number}',
-              style: const TextStyle(
-                fontFamily: 'Montserrat',
-                color: Colors.white,
-                fontSize: 10.5,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const Spacer(),
-            Flexible(
-              child: Text(
-                '${_formatDistanceShort(lap.distanceMeters)} · ${_formatDuration(lap.durationSeconds)} · ${_formatLapMetric(lap)}',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: _showLapsSheet,
+        borderRadius: BorderRadius.circular(13),
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+          decoration: BoxDecoration(
+            color: const Color(0xFF091B2A),
+            borderRadius: BorderRadius.circular(13),
+            border: Border.all(color: const Color(0x14FFFFFF), width: 0.7),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.flag_outlined, color: _klsGold, size: 14),
+              const SizedBox(width: 7),
+              Text(
+                'Круг ${lap.number}',
+                style: const TextStyle(
                   fontFamily: 'Montserrat',
-                  color: Colors.white.withOpacity(0.58),
-                  fontSize: 9.3,
+                  color: Color(0xFFF5F7FA),
+                  fontSize: 10,
+                  fontWeight: FontWeight.w500,
                 ),
               ),
-            ),
-          ],
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  '${_formatDistanceShort(lap.distanceMeters)} · ${_formatDuration(lap.durationSeconds)} · ${_formatLapMetric(lap)}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.right,
+                  style: const TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: Color(0xFF8A98A9),
+                    fontSize: 8.8,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              const _KlsGpsLongArrow(color: Color(0xFF8A98A9)),
+            ],
+          ),
         ),
       ),
     );
@@ -2869,31 +4904,33 @@ class _KlsGpsWorkoutRecorderWidgetState
 
     return SizedBox(
       width: double.infinity,
-      height: 54,
+      height: 50,
       child: ElevatedButton(
         onPressed: enabled ? _startWorkout : null,
         style: ElevatedButton.styleFrom(
           backgroundColor: _klsGold,
-          disabledBackgroundColor: _klsGold.withOpacity(0.22),
-          foregroundColor: const Color(0xFF08111F),
-          disabledForegroundColor: Colors.white.withOpacity(0.42),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          disabledBackgroundColor: const Color(0xFF0D2234),
+          foregroundColor: const Color(0xFF061522),
+          disabledForegroundColor: const Color(0xFF667587),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
           elevation: 0,
         ),
         child: Text(
           _isRestoring
               ? 'Проверяем сохранённую тренировку…'
               : _isStarting
-                  ? 'Подготавливаем тренировку…'
-                  : (_backgroundGpsChecked && !_backgroundGpsCapable)
-                      ? 'Нужно включить фоновый GPS'
-                      : _gpsReadyForStart
-                          ? 'Начать тренировку'
-                          : 'Ожидаем GPS',
+              ? 'Подготавливаем тренировку…'
+              : (_backgroundGpsChecked && !_backgroundGpsCapable)
+              ? 'Нужно включить фоновый GPS'
+              : _gpsReadyForStart
+              ? 'Начать тренировку'
+              : 'Ожидаем GPS',
           style: const TextStyle(
             fontFamily: 'Montserrat',
-            fontSize: 14,
-            fontWeight: FontWeight.w700,
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
           ),
         ),
       ),
@@ -2944,32 +4981,52 @@ class _KlsGpsWorkoutRecorderWidgetState
   }) {
     return Material(
       color: Colors.transparent,
+      borderRadius: BorderRadius.circular(14),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(14),
         child: Container(
-          height: 52,
+          height: 50,
           decoration: BoxDecoration(
-            color: filled ? accent : accent.withOpacity(0.06),
-            borderRadius: BorderRadius.circular(18),
+            color: filled ? accent : const Color(0xFF091B2A),
+            borderRadius: BorderRadius.circular(14),
             border: Border.all(
-              color: accent.withOpacity(filled ? 0.90 : 0.24),
+              color: filled
+                  ? accent
+                  : accent == Colors.white
+                  ? const Color(0x14FFFFFF)
+                  : accent.withOpacity(0.24),
+              width: 0.7,
             ),
           ),
-          child: Column(
+          child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 17, color: filled ? Colors.white : accent),
-              const SizedBox(height: 3),
-              Text(
-                label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  fontFamily: 'Montserrat',
-                  color: filled ? Colors.white : accent,
-                  fontSize: 9.5,
-                  fontWeight: FontWeight.w600,
+              Icon(
+                icon,
+                size: 15,
+                color: filled
+                    ? Colors.white
+                    : accent == Colors.white
+                    ? const Color(0xFFAAB6C5)
+                    : accent,
+              ),
+              const SizedBox(width: 6),
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontFamily: 'Montserrat',
+                    color: filled
+                        ? Colors.white
+                        : accent == Colors.white
+                        ? const Color(0xFFF5F7FA)
+                        : accent,
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w500,
+                  ),
                 ),
               ),
             ],
@@ -2982,54 +5039,52 @@ class _KlsGpsWorkoutRecorderWidgetState
   Widget _countdownOverlay() {
     return Positioned.fill(
       child: Container(
-        color: const Color(0xE6030B16),
+        color: const Color(0xF2061522),
         child: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Container(
-                width: 150,
-                height: 150,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: _klsGold.withOpacity(0.10),
-                  border: Border.all(color: _klsGold, width: 2),
-                  boxShadow: [
-                    BoxShadow(
-                      color: _klsGold.withOpacity(0.26),
-                      blurRadius: 38,
-                    ),
-                  ],
-                ),
-                child: Center(
-                  child: Text(
-                    '${_countdownValue ?? ''}',
-                    style: const TextStyle(
-                      fontFamily: 'Montserrat',
-                      color: _klsGold,
-                      fontSize: 72,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
+              const Text(
+                'СТАРТ ЧЕРЕЗ',
+                style: TextStyle(
+                  fontFamily: 'Montserrat',
+                  color: Color(0xFF8A98A9),
+                  fontSize: 9.5,
+                  fontWeight: FontWeight.w500,
+                  letterSpacing: 1.15,
                 ),
               ),
+              const SizedBox(height: 16),
+              Text(
+                '${_countdownValue ?? ''}',
+                style: const TextStyle(
+                  fontFamily: 'Montserrat',
+                  color: _klsGold,
+                  fontSize: 92,
+                  height: 0.9,
+                  fontWeight: FontWeight.w300,
+                  letterSpacing: -3,
+                ),
+              ),
+              const SizedBox(height: 18),
+              Container(width: 38, height: 1, color: _klsGold),
               const SizedBox(height: 18),
               const Text(
                 'Приготовьтесь',
                 style: TextStyle(
                   fontFamily: 'Montserrat',
-                  color: Colors.white,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w600,
+                  color: Color(0xFFF5F7FA),
+                  fontSize: 15.5,
+                  fontWeight: FontWeight.w500,
                 ),
               ),
               const SizedBox(height: 5),
-              Text(
+              const Text(
                 'Запись начнётся после отсчёта',
                 style: TextStyle(
                   fontFamily: 'Montserrat',
-                  color: Colors.white.withOpacity(0.52),
-                  fontSize: 11,
+                  color: Color(0xFF8A98A9),
+                  fontSize: 10,
                 ),
               ),
             ],
@@ -3053,8 +5108,9 @@ class _KlsGpsWorkoutRecorderWidgetState
                   _currentPosition!.longitude,
                 ),
           accuracyMeters: _accuracy,
-          headingDegrees:
-              _hasMovementBearing ? _movementBearingDegrees : _heading,
+          headingDegrees: _hasMovementBearing
+              ? _movementBearingDegrees
+              : _heading,
         ),
       ),
     );
@@ -3071,7 +5127,10 @@ class _KlsGpsWorkoutRecorderWidgetState
           child: Container(
             decoration: const BoxDecoration(
               color: _klsNavy,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+              border: Border(
+                top: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+              ),
             ),
             child: SafeArea(
               top: false,
@@ -3079,15 +5138,15 @@ class _KlsGpsWorkoutRecorderWidgetState
                 children: [
                   const SizedBox(height: 10),
                   Container(
-                    width: 42,
-                    height: 4,
+                    width: 34,
+                    height: 3,
                     decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.22),
+                      color: const Color(0xFF8A98A9).withOpacity(0.28),
                       borderRadius: BorderRadius.circular(99),
                     ),
                   ),
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(18, 14, 10, 8),
+                    padding: const EdgeInsets.fromLTRB(18, 16, 14, 10),
                     child: Row(
                       children: [
                         const Expanded(
@@ -3095,38 +5154,57 @@ class _KlsGpsWorkoutRecorderWidgetState
                             'Круги и отсечки',
                             style: TextStyle(
                               fontFamily: 'Montserrat',
-                              color: Colors.white,
+                              color: Color(0xFFF5F7FA),
                               fontSize: 18,
-                              fontWeight: FontWeight.w700,
+                              fontWeight: FontWeight.w500,
                             ),
                           ),
                         ),
-                        IconButton(
-                          onPressed: () => Navigator.pop(sheetContext),
-                          icon: const Icon(Icons.close_rounded, color: _klsGold),
+                        Material(
+                          color: Colors.transparent,
+                          shape: const CircleBorder(),
+                          child: InkWell(
+                            customBorder: const CircleBorder(),
+                            onTap: () => Navigator.pop(sheetContext),
+                            child: const SizedBox(
+                              width: 40,
+                              height: 40,
+                              child: Icon(
+                                Icons.close_rounded,
+                                color: Color(0xFFAAB6C5),
+                                size: 19,
+                              ),
+                            ),
+                          ),
                         ),
                       ],
                     ),
                   ),
+                  const Divider(
+                    height: 0.7,
+                    thickness: 0.7,
+                    color: Color(0x14FFFFFF),
+                  ),
                   Expanded(
                     child: _laps.isEmpty
-                        ? Center(
-                            child: Text(
-                              'Первая автоматическая отсечка появится на 1 км.\nВо время записи можно нажать «Круг».',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                fontFamily: 'Montserrat',
-                                color: Colors.white.withOpacity(0.54),
-                                fontSize: 11,
-                                height: 1.5,
+                        ? const Center(
+                            child: Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 28),
+                              child: Text(
+                                'Первая автоматическая отсечка появится на 1 км.\nВо время записи можно нажать «Круг».',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontFamily: 'Montserrat',
+                                  color: Color(0xFF8A98A9),
+                                  fontSize: 10.5,
+                                  height: 1.5,
+                                ),
                               ),
                             ),
                           )
-                        : ListView.separated(
+                        : ListView.builder(
                             padding: const EdgeInsets.fromLTRB(18, 4, 18, 24),
                             itemCount: _laps.length,
-                            separatorBuilder: (_, __) =>
-                                const SizedBox(height: 8),
                             itemBuilder: (context, index) =>
                                 _lapRow(_laps[index]),
                           ),
@@ -3142,30 +5220,28 @@ class _KlsGpsWorkoutRecorderWidgetState
 
   Widget _lapRow(_WorkoutLap lap) {
     return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: _surfaceDecoration(radius: 17),
+      constraints: const BoxConstraints(minHeight: 58),
+      padding: const EdgeInsets.symmetric(vertical: 11),
+      decoration: const BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+        ),
+      ),
       child: Row(
         children: [
-          Container(
-            width: 34,
-            height: 34,
-            decoration: BoxDecoration(
-              color: _klsGold.withOpacity(0.10),
-              borderRadius: BorderRadius.circular(11),
-            ),
-            child: Center(
-              child: Text(
-                '${lap.number}',
-                style: const TextStyle(
-                  fontFamily: 'Montserrat',
-                  color: _klsGold,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                ),
+          SizedBox(
+            width: 30,
+            child: Text(
+              '${lap.number}',
+              style: const TextStyle(
+                fontFamily: 'Montserrat',
+                color: _klsGold,
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
               ),
             ),
           ),
-          const SizedBox(width: 10),
+          const SizedBox(width: 8),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -3174,18 +5250,18 @@ class _KlsGpsWorkoutRecorderWidgetState
                   _formatDistanceShort(lap.distanceMeters),
                   style: const TextStyle(
                     fontFamily: 'Montserrat',
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
+                    color: Color(0xFFF5F7FA),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
                 const SizedBox(height: 3),
                 Text(
                   lap.isAutomatic ? 'Автоматическая отсечка' : 'Ручной круг',
-                  style: TextStyle(
+                  style: const TextStyle(
                     fontFamily: 'Montserrat',
-                    color: Colors.white.withOpacity(0.42),
-                    fontSize: 8.8,
+                    color: Color(0xFF8A98A9),
+                    fontSize: 8,
                   ),
                 ),
               ],
@@ -3193,10 +5269,7 @@ class _KlsGpsWorkoutRecorderWidgetState
           ),
           _lapValue('Время', _formatDuration(lap.durationSeconds)),
           const SizedBox(width: 12),
-          _lapValue(
-            _usesPace ? 'Темп' : 'Скорость',
-            _formatLapMetric(lap),
-          ),
+          _lapValue(_usesPace ? 'Темп' : 'Скорость', _formatLapMetric(lap)),
           const SizedBox(width: 12),
           _lapValue('Набор', '${lap.elevationGainMeters.round()} м'),
         ],
@@ -3210,20 +5283,20 @@ class _KlsGpsWorkoutRecorderWidgetState
       children: [
         Text(
           label,
-          style: TextStyle(
+          style: const TextStyle(
             fontFamily: 'Montserrat',
-            color: Colors.white.withOpacity(0.38),
-            fontSize: 7.8,
+            color: Color(0xFF667587),
+            fontSize: 7.2,
           ),
         ),
-        const SizedBox(height: 2),
+        const SizedBox(height: 3),
         Text(
           value,
           style: const TextStyle(
             fontFamily: 'Montserrat',
-            color: Colors.white,
-            fontSize: 9.7,
-            fontWeight: FontWeight.w600,
+            color: Color(0xFFF5F7FA),
+            fontSize: 9,
+            fontWeight: FontWeight.w500,
           ),
         ),
       ],
@@ -3233,29 +5306,26 @@ class _KlsGpsWorkoutRecorderWidgetState
   Widget _errorBox() {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(10),
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 9),
       decoration: BoxDecoration(
-        color: _klsRed.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _klsRed.withOpacity(0.18)),
+        color: _klsRed.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(13),
+        border: Border.all(color: _klsRed.withOpacity(0.18), width: 0.7),
       ),
       child: Row(
         children: [
-          const Icon(
-            Icons.error_outline_rounded,
-            color: Color(0xFFFFB3B3),
-            size: 17,
-          ),
+          const Icon(Icons.error_outline_rounded, color: _klsRed, size: 15),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
               _errorText!,
-              maxLines: 2,
+              maxLines: 3,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
-                color: Color(0xFFFFB3B3),
+                color: Color(0xFFEC8585),
                 fontFamily: 'Montserrat',
-                fontSize: 10,
+                fontSize: 9.5,
+                height: 1.35,
               ),
             ),
           ),
@@ -3266,28 +5336,28 @@ class _KlsGpsWorkoutRecorderWidgetState
 
   BoxDecoration _surfaceDecoration({required double radius}) {
     return BoxDecoration(
-      color: Colors.white.withOpacity(0.055),
+      color: const Color(0xFF091B2A),
       borderRadius: BorderRadius.circular(radius),
-      border: Border.all(color: Colors.white.withOpacity(0.09)),
+      border: Border.all(color: const Color(0x14FFFFFF), width: 0.7),
     );
   }
 
   TextStyle _mutedTextStyle(double size) {
     return TextStyle(
-      color: Colors.white.withOpacity(0.50),
+      color: const Color(0xFF8A98A9),
       fontFamily: 'Montserrat',
       fontSize: size,
-      fontWeight: FontWeight.w500,
+      fontWeight: FontWeight.w400,
     );
   }
 
   TextStyle _metricLabel() {
-    return TextStyle(
-      color: Colors.white.withOpacity(0.42),
+    return const TextStyle(
+      color: Color(0xFF8A98A9),
       fontFamily: 'Montserrat',
-      fontSize: 8.5,
-      fontWeight: FontWeight.w600,
-      letterSpacing: 0.6,
+      fontSize: 8,
+      fontWeight: FontWeight.w500,
+      letterSpacing: 0.65,
     );
   }
 
@@ -3295,8 +5365,12 @@ class _KlsGpsWorkoutRecorderWidgetState
     return Container(
       width: size,
       height: size,
-      decoration: _surfaceDecoration(radius: 14),
-      child: Icon(icon, color: Colors.white, size: 17),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: const Color(0xFF091B2A),
+        border: Border.all(color: const Color(0x18FFFFFF), width: 0.7),
+      ),
+      child: Icon(icon, color: const Color(0xFFAAB6C5), size: 18),
     );
   }
 
@@ -3305,25 +5379,25 @@ class _KlsGpsWorkoutRecorderWidgetState
       constraints: const BoxConstraints(maxWidth: 190),
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
       decoration: BoxDecoration(
-        color: const Color(0xDD061326),
-        borderRadius: BorderRadius.circular(13),
-        border: Border.all(color: Colors.white.withOpacity(0.12)),
+        color: const Color(0xEE061522),
+        borderRadius: BorderRadius.circular(11),
+        border: Border.all(color: const Color(0x18FFFFFF), width: 0.7),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, color: _gpsStatusColor, size: 14),
-          const SizedBox(width: 5),
+          Icon(icon, color: _gpsStatusColor, size: 12),
+          const SizedBox(width: 6),
           Flexible(
             child: Text(
               label,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
-                color: Colors.white,
+                color: Color(0xFFF5F7FA),
                 fontFamily: 'Montserrat',
-                fontSize: 9.5,
-                fontWeight: FontWeight.w600,
+                fontSize: 8.5,
+                fontWeight: FontWeight.w500,
               ),
             ),
           ),
@@ -3337,20 +5411,28 @@ class _KlsGpsWorkoutRecorderWidgetState
     required VoidCallback onTap,
     bool active = false,
   }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 36,
-        height: 36,
-        decoration: BoxDecoration(
-          color: active ? _klsGold : const Color(0xDD061326),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.white.withOpacity(0.12)),
-        ),
-        child: Icon(
-          icon,
-          color: active ? const Color(0xFF08111F) : Colors.white,
-          size: 19,
+    return Material(
+      color: Colors.transparent,
+      shape: const CircleBorder(),
+      child: InkWell(
+        onTap: onTap,
+        customBorder: const CircleBorder(),
+        child: Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: active ? _klsGold : const Color(0xEE061522),
+            border: Border.all(
+              color: active ? _klsGold : const Color(0x18FFFFFF),
+              width: 0.7,
+            ),
+          ),
+          child: Icon(
+            icon,
+            color: active ? const Color(0xFF061522) : const Color(0xFFF5F7FA),
+            size: 17,
+          ),
         ),
       ),
     );
@@ -3362,6 +5444,7 @@ class _KlsGpsWorkoutRecorderWidgetState
     _fatigue = 2;
     _sleepHours = 8;
     _commentController.clear();
+    String? diarySaveWarning;
 
     showModalBottomSheet<void>(
       context: context,
@@ -3370,365 +5453,452 @@ class _KlsGpsWorkoutRecorderWidgetState
       isDismissible: false,
       enableDrag: false,
       builder: (sheetContext) {
-        return StatefulBuilder(
-          builder: (context, setSheetState) {
-            final distanceKm = _asDouble(data['distance_km']);
-            final duration = _asInt(data['duration_seconds']);
-            final pace = _asDouble(data['avg_pace_seconds_per_km']);
-            final speed = _asDouble(data['avg_speed_kmh']);
+        return PopScope(
+          canPop: false,
+          child: StatefulBuilder(
+            builder: (context, setSheetState) {
+              final distanceKm = _asDouble(data['distance_km']);
+              final duration = _asInt(data['duration_seconds']);
+              final pace = _asDouble(data['avg_pace_seconds_per_km']);
+              final speed = _asDouble(data['avg_speed_kmh']);
 
-            return Container(
-              height: MediaQuery.of(context).size.height * 0.94,
-              decoration: const BoxDecoration(
-                color: _klsNavy,
-                borderRadius: BorderRadius.vertical(top: Radius.circular(30)),
-              ),
-              child: SafeArea(
-                top: false,
-                child: Column(
-                  children: [
-                    const SizedBox(height: 10),
-                    Container(
-                      width: 44,
-                      height: 4,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.22),
-                        borderRadius: BorderRadius.circular(99),
+              return Container(
+                height: MediaQuery.of(context).size.height * 0.94,
+                decoration: const BoxDecoration(
+                  color: _klsNavy,
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(30)),
+                ),
+                child: SafeArea(
+                  top: false,
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 10),
+                      Container(
+                        width: 44,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withOpacity(0.22),
+                          borderRadius: BorderRadius.circular(99),
+                        ),
                       ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(18, 12, 10, 8),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  _selectedSport.title,
-                                  style: const TextStyle(
-                                    fontFamily: 'Montserrat',
-                                    color: Colors.white,
-                                    fontSize: 20,
-                                    fontWeight: FontWeight.w700,
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(18, 12, 10, 8),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    _selectedSport.title,
+                                    style: const TextStyle(
+                                      fontFamily: 'Montserrat',
+                                      color: Colors.white,
+                                      fontSize: 20,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    'Тренировка завершена',
+                                    style: TextStyle(
+                                      fontFamily: 'Montserrat',
+                                      color: Colors.white.withOpacity(0.46),
+                                      fontSize: 10.5,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      Expanded(
+                        child: SingleChildScrollView(
+                          physics: const BouncingScrollPhysics(),
+                          padding: const EdgeInsets.fromLTRB(18, 4, 18, 16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _finishHeroCard(
+                                distanceKm,
+                                duration,
+                                pace,
+                                speed,
+                              ),
+                              if (_finishedHeartRateSampleCount > 0 ||
+                                  _coachHeartRateSampleCount > 0) ...[
+                                const SizedBox(height: 10),
+                                _finishHeartRateCard(),
+                              ],
+                              const SizedBox(height: 10),
+                              SizedBox(
+                                height: 190,
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(18),
+                                  child: _KlsStaticRouteMap(
+                                    segments: _routeSegments,
+                                    showFinishMarker: true,
+                                    currentPoint: null,
+                                    accuracyMeters: 0,
+                                    headingDegrees: 0,
                                   ),
                                 ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  'Тренировка завершена',
-                                  style: TextStyle(
+                              ),
+                              const SizedBox(height: 16),
+                              Row(
+                                children: [
+                                  const Expanded(
+                                    child: Text(
+                                      'Круги и отсечки',
+                                      style: TextStyle(
+                                        fontFamily: 'Montserrat',
+                                        color: Colors.white,
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                  ),
+                                  Text(
+                                    '${_laps.length}',
+                                    style: const TextStyle(
+                                      fontFamily: 'Montserrat',
+                                      color: _klsGold,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              if (_laps.isEmpty)
+                                Container(
+                                  width: double.infinity,
+                                  padding: const EdgeInsets.all(13),
+                                  decoration: _surfaceDecoration(radius: 17),
+                                  child: Text(
+                                    'Отсечки не созданы.',
+                                    style: TextStyle(
+                                      fontFamily: 'Montserrat',
+                                      color: Colors.white.withOpacity(0.50),
+                                      fontSize: 10.5,
+                                    ),
+                                  ),
+                                )
+                              else
+                                ..._laps.map(
+                                  (lap) => Padding(
+                                    padding: const EdgeInsets.only(bottom: 8),
+                                    child: _lapRow(lap),
+                                  ),
+                                ),
+                              const SizedBox(height: 10),
+                              const Text(
+                                'Оценка тренировки',
+                                style: TextStyle(
+                                  fontFamily: 'Montserrat',
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              _sheetSlider(
+                                'Самочувствие',
+                                _wellbeing.toDouble(),
+                                1,
+                                5,
+                                4,
+                                '$_wellbeing / 5',
+                                (value) => setSheetState(
+                                  () => _wellbeing = value.round(),
+                                ),
+                              ),
+                              _sheetSlider(
+                                'RPE / сложность',
+                                _rpe.toDouble(),
+                                1,
+                                10,
+                                9,
+                                '$_rpe / 10',
+                                (value) =>
+                                    setSheetState(() => _rpe = value.round()),
+                              ),
+                              _sheetSlider(
+                                'Усталость',
+                                _fatigue.toDouble(),
+                                1,
+                                5,
+                                4,
+                                '$_fatigue / 5',
+                                (value) => setSheetState(
+                                  () => _fatigue = value.round(),
+                                ),
+                              ),
+                              _sheetSlider(
+                                'Сон',
+                                _sleepHours,
+                                0,
+                                12,
+                                24,
+                                '${_sleepHours.toStringAsFixed(1)} ч',
+                                (value) => setSheetState(
+                                  () => _sleepHours = double.parse(
+                                    value.toStringAsFixed(1),
+                                  ),
+                                ),
+                              ),
+                              TextField(
+                                controller: _commentController,
+                                maxLines: 3,
+                                cursorColor: _klsGold,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontFamily: 'Montserrat',
+                                  fontSize: 12,
+                                ),
+                                decoration: InputDecoration(
+                                  hintText: 'Комментарий к тренировке',
+                                  hintStyle: TextStyle(
+                                    color: Colors.white.withOpacity(0.34),
                                     fontFamily: 'Montserrat',
-                                    color: Colors.white.withOpacity(0.46),
-                                    fontSize: 10.5,
+                                    fontSize: 11,
+                                  ),
+                                  filled: true,
+                                  fillColor: Colors.white.withOpacity(0.05),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(18),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                ),
+                              ),
+                              if (diarySaveWarning != null) ...[
+                                const SizedBox(height: 12),
+                                Container(
+                                  width: double.infinity,
+                                  padding: const EdgeInsets.all(13),
+                                  decoration: BoxDecoration(
+                                    color: _klsRed.withOpacity(0.09),
+                                    borderRadius: BorderRadius.circular(17),
+                                    border: Border.all(
+                                      color: _klsRed.withOpacity(0.28),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      const Icon(
+                                        Icons.cloud_off_rounded,
+                                        color: _klsRed,
+                                        size: 20,
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Text(
+                                          diarySaveWarning!,
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontFamily: 'Montserrat',
+                                            fontSize: 11.5,
+                                            height: 1.4,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ],
-                            ),
-                          ),
-                          IconButton(
-                            onPressed: _isSavingDiary
-                                ? null
-                                : () {
-                                    _awaitingDiarySave = false;
-                                    Navigator.pop(sheetContext);
-                                    unawaited(
-                                      _offlineManager.syncPendingWorkouts(),
-                                    );
-                                  },
-                            icon: const Icon(
-                              Icons.close_rounded,
-                              color: _klsGold,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Expanded(
-                      child: SingleChildScrollView(
-                        physics: const BouncingScrollPhysics(),
-                        padding: const EdgeInsets.fromLTRB(18, 4, 18, 16),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            _finishHeroCard(
-                              distanceKm,
-                              duration,
-                              pace,
-                              speed,
-                            ),
-                            if (_finishedHeartRateSampleCount > 0) ...[
-                              const SizedBox(height: 10),
-                              _finishHeartRateCard(),
                             ],
-                            const SizedBox(height: 10),
-                            SizedBox(
-                              height: 190,
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(22),
-                                child: _KlsStaticRouteMap(
-                                  segments: _routeSegments,
-                                  showFinishMarker: true,
-                                  currentPoint: null,
-                                  accuracyMeters: 0,
-                                  headingDegrees: 0,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 16),
-                            Row(
-                              children: [
-                                const Expanded(
-                                  child: Text(
-                                    'Круги и отсечки',
+                          ),
+                        ),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(18, 8, 18, 16),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: SizedBox(
+                                height: 52,
+                                child: OutlinedButton(
+                                  onPressed: _isSavingDiary
+                                      ? null
+                                      : () async {
+                                          _awaitingDiarySave = false;
+                                          Navigator.pop(sheetContext);
+                                          _showSavedSnack(
+                                            'Тренировка сохранена на телефоне. Отправим её в дневник автоматически.',
+                                          );
+                                          unawaited(
+                                            _offlineManager
+                                                .syncPendingWorkouts(),
+                                          );
+                                          await Future<void>.delayed(
+                                            const Duration(milliseconds: 250),
+                                          );
+                                          if (mounted) {
+                                            Navigator.of(
+                                              this.context,
+                                            ).pop(true);
+                                          }
+                                        },
+                                  style: OutlinedButton.styleFrom(
+                                    side: BorderSide(
+                                      color: Colors.white.withOpacity(0.16),
+                                    ),
+                                    foregroundColor: Colors.white,
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(18),
+                                    ),
+                                  ),
+                                  child: const Text(
+                                    'Отправить позже',
+                                    textAlign: TextAlign.center,
                                     style: TextStyle(
                                       fontFamily: 'Montserrat',
-                                      color: Colors.white,
-                                      fontSize: 15,
-                                      fontWeight: FontWeight.w700,
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w500,
                                     ),
                                   ),
                                 ),
-                                Text(
-                                  '${_laps.length}',
-                                  style: const TextStyle(
-                                    fontFamily: 'Montserrat',
-                                    color: _klsGold,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              flex: 2,
+                              child: SizedBox(
+                                height: 52,
+                                child: ElevatedButton(
+                                  onPressed: _isSavingDiary
+                                      ? null
+                                      : () async {
+                                          setState(() => _isSavingDiary = true);
+                                          setSheetState(() {});
+
+                                          try {
+                                            final syncResult =
+                                                await _saveFinishedWorkoutToDiary(
+                                                  data,
+                                                );
+
+                                            if (!mounted) return;
+
+                                            if (!syncResult.synced) {
+                                              final syncError =
+                                                  syncResult.error?.trim() ??
+                                                  '';
+                                              debugPrint(
+                                                'Не удалось добавить GPS-тренировку '
+                                                '$_workoutId в дневник: $syncError',
+                                              );
+                                              unawaited(
+                                                _trackEvent(
+                                                  'diary_sync_failed',
+                                                  metadata: {
+                                                    'workout_id': _workoutId,
+                                                    'sport_type': _sportType,
+                                                    'error': syncError,
+                                                  },
+                                                ),
+                                              );
+                                              setState(
+                                                () => _isSavingDiary = false,
+                                              );
+                                              setSheetState(() {
+                                                diarySaveWarning =
+                                                    'Не удалось отправить тренировку в дневник. '
+                                                    'Она сохранена на этом телефоне вместе с маршрутом. '
+                                                    'Проверьте интернет и нажмите «Повторить отправку».';
+                                              });
+                                              return;
+                                            }
+
+                                            setState(
+                                              () => _isSavingDiary = false,
+                                            );
+                                            setSheetState(
+                                              () => diarySaveWarning = null,
+                                            );
+                                            _awaitingDiarySave = false;
+                                            Navigator.pop(sheetContext);
+
+                                            _showSavedSnack(
+                                              _hasPlanContext
+                                                  ? 'Тренировка сохранена и связана с планом'
+                                                  : 'Тренировка добавлена в дневник',
+                                            );
+
+                                            await Future<void>.delayed(
+                                              const Duration(milliseconds: 250),
+                                            );
+
+                                            if (mounted) {
+                                              Navigator.of(
+                                                this.context,
+                                              ).pop(true);
+                                            }
+                                          } catch (error) {
+                                            if (mounted) {
+                                              final cleanError = _cleanError(
+                                                error,
+                                              );
+                                              debugPrint(
+                                                'Ошибка сохранения GPS-тренировки '
+                                                '$_workoutId: $cleanError',
+                                              );
+                                              unawaited(
+                                                _trackEvent(
+                                                  'diary_sync_failed',
+                                                  metadata: {
+                                                    'workout_id': _workoutId,
+                                                    'sport_type': _sportType,
+                                                    'error': cleanError,
+                                                  },
+                                                ),
+                                              );
+                                              setState(
+                                                () => _isSavingDiary = false,
+                                              );
+                                              setSheetState(() {
+                                                diarySaveWarning =
+                                                    'Не удалось отправить тренировку в дневник. '
+                                                    'Она сохранена на этом телефоне вместе с маршрутом. '
+                                                    'Проверьте интернет и нажмите «Повторить отправку».';
+                                              });
+                                            }
+                                          }
+                                        },
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: _klsGold,
+                                    foregroundColor: const Color(0xFF061522),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(18),
+                                    ),
+                                    elevation: 0,
                                   ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            if (_laps.isEmpty)
-                              Container(
-                                width: double.infinity,
-                                padding: const EdgeInsets.all(13),
-                                decoration: _surfaceDecoration(radius: 17),
-                                child: Text(
-                                  'Отсечки не созданы.',
-                                  style: TextStyle(
-                                    fontFamily: 'Montserrat',
-                                    color: Colors.white.withOpacity(0.50),
-                                    fontSize: 10.5,
+                                  child: Text(
+                                    _isSavingDiary
+                                        ? 'Сохраняем…'
+                                        : diarySaveWarning == null
+                                        ? 'Сохранить в дневник'
+                                        : 'Повторить отправку',
+                                    style: const TextStyle(
+                                      fontFamily: 'Montserrat',
+                                      fontWeight: FontWeight.w500,
+                                    ),
                                   ),
-                                ),
-                              )
-                            else
-                              ..._laps.map(
-                                (lap) => Padding(
-                                  padding: const EdgeInsets.only(bottom: 8),
-                                  child: _lapRow(lap),
-                                ),
-                              ),
-                            const SizedBox(height: 10),
-                            const Text(
-                              'Оценка тренировки',
-                              style: TextStyle(
-                                fontFamily: 'Montserrat',
-                                color: Colors.white,
-                                fontSize: 15,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            _sheetSlider(
-                              'Самочувствие',
-                              _wellbeing.toDouble(),
-                              1,
-                              5,
-                              4,
-                              '$_wellbeing / 5',
-                              (value) => setSheetState(
-                                () => _wellbeing = value.round(),
-                              ),
-                            ),
-                            _sheetSlider(
-                              'RPE / сложность',
-                              _rpe.toDouble(),
-                              1,
-                              10,
-                              9,
-                              '$_rpe / 10',
-                              (value) => setSheetState(
-                                () => _rpe = value.round(),
-                              ),
-                            ),
-                            _sheetSlider(
-                              'Усталость',
-                              _fatigue.toDouble(),
-                              1,
-                              5,
-                              4,
-                              '$_fatigue / 5',
-                              (value) => setSheetState(
-                                () => _fatigue = value.round(),
-                              ),
-                            ),
-                            _sheetSlider(
-                              'Сон',
-                              _sleepHours,
-                              0,
-                              12,
-                              24,
-                              '${_sleepHours.toStringAsFixed(1)} ч',
-                              (value) => setSheetState(
-                                () => _sleepHours = double.parse(
-                                  value.toStringAsFixed(1),
-                                ),
-                              ),
-                            ),
-                            TextField(
-                              controller: _commentController,
-                              maxLines: 3,
-                              cursorColor: _klsGold,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontFamily: 'Montserrat',
-                                fontSize: 12,
-                              ),
-                              decoration: InputDecoration(
-                                hintText: 'Комментарий к тренировке',
-                                hintStyle: TextStyle(
-                                  color: Colors.white.withOpacity(0.34),
-                                  fontFamily: 'Montserrat',
-                                  fontSize: 11,
-                                ),
-                                filled: true,
-                                fillColor: Colors.white.withOpacity(0.05),
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(18),
-                                  borderSide: BorderSide.none,
                                 ),
                               ),
                             ),
                           ],
                         ),
                       ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(18, 8, 18, 16),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: SizedBox(
-                              height: 52,
-                              child: OutlinedButton(
-                                onPressed: _isSavingDiary
-                                    ? null
-                                    : () {
-                                        _awaitingDiarySave = false;
-                                        Navigator.pop(sheetContext);
-                                        unawaited(
-                                          _offlineManager.syncPendingWorkouts(),
-                                        );
-                                      },
-                                style: OutlinedButton.styleFrom(
-                                  side: BorderSide(
-                                    color: Colors.white.withOpacity(0.16),
-                                  ),
-                                  foregroundColor: Colors.white,
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(18),
-                                  ),
-                                ),
-                                child: const Text(
-                                  'Позже',
-                                  style: TextStyle(
-                                    fontFamily: 'Montserrat',
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            flex: 2,
-                            child: SizedBox(
-                              height: 52,
-                              child: ElevatedButton(
-                                onPressed: _isSavingDiary
-                                    ? null
-                                    : () async {
-                                        setState(() => _isSavingDiary = true);
-                                        setSheetState(() {});
-
-                                        try {
-                                          final syncResult =
-                                              await _saveFinishedWorkoutToDiary(
-                                            data,
-                                          );
-
-                                          _awaitingDiarySave = false;
-                                          if (!mounted) return;
-
-                                          Navigator.pop(sheetContext);
-
-                                          _showSavedSnack(
-                                            syncResult.synced
-                                                ? (_hasPlanContext
-                                                    ? 'Тренировка сохранена и связана с планом'
-                                                    : 'Тренировка добавлена в дневник')
-                                                : 'Тренировка сохранена на телефоне и отправится автоматически',
-                                          );
-
-                                          await Future<void>.delayed(
-                                            const Duration(milliseconds: 250),
-                                          );
-
-                                          if (mounted) {
-                                            Navigator.of(this.context).pop(true);
-                                          }
-                                        } catch (error) {
-                                          if (mounted) {
-                                            ScaffoldMessenger.of(context)
-                                                .showSnackBar(
-                                              SnackBar(
-                                                content: Text(
-                                                  _cleanError(error),
-                                                ),
-                                                behavior:
-                                                    SnackBarBehavior.floating,
-                                              ),
-                                            );
-                                          }
-                                        } finally {
-                                          if (mounted) {
-                                            setState(
-                                              () => _isSavingDiary = false,
-                                            );
-                                          }
-                                        }
-                                      },
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: _klsGold,
-                                  foregroundColor: const Color(0xFF08111F),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(18),
-                                  ),
-                                  elevation: 0,
-                                ),
-                                child: Text(
-                                  _isSavingDiary
-                                      ? 'Сохраняем…'
-                                      : 'Сохранить в дневник',
-                                  style: const TextStyle(
-                                    fontFamily: 'Montserrat',
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            );
-          },
+              );
+            },
+          ),
         );
       },
     );
@@ -3740,64 +5910,114 @@ class _KlsGpsWorkoutRecorderWidgetState
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: _klsRed.withOpacity(0.055),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: _klsRed.withOpacity(0.16)),
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      decoration: const BoxDecoration(
+        border: Border(
+          top: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+          bottom: BorderSide(color: Color(0x14FFFFFF), width: 0.7),
+        ),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         children: [
-          Row(
-            children: [
-              const Icon(Icons.favorite_rounded, color: _klsRed, size: 18),
-              const SizedBox(width: 7),
-              const Expanded(
-                child: Text(
-                  'Пульс',
-                  style: TextStyle(
-                    fontFamily: 'Montserrat',
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-              if ((_finishedHeartRateDeviceName ?? '').isNotEmpty)
-                Flexible(
-                  child: Text(
-                    _finishedHeartRateDeviceName!,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontFamily: 'Montserrat',
-                      color: Colors.white.withOpacity(0.38),
-                      fontSize: 8.5,
-                    ),
-                  ),
-                ),
-            ],
+          const Icon(Icons.favorite_rounded, color: _klsRed, size: 16),
+          const SizedBox(width: 9),
+          const Text(
+            'Пульс',
+            style: TextStyle(
+              fontFamily: 'Montserrat',
+              color: Color(0xFFF5F7FA),
+              fontSize: 11.5,
+              fontWeight: FontWeight.w500,
+            ),
           ),
-          const SizedBox(height: 11),
-          Row(
-            children: [
-              Expanded(
-                child: _finishMetric(
-                  'Средний пульс',
-                  avg != null ? '$avg уд/мин' : '—',
-                  Icons.favorite_outline,
-                ),
+          const Spacer(),
+          if (avg != null) _finishInlineValue('ср.', '$avg'),
+          if (avg != null && maxBpm != null) const SizedBox(width: 16),
+          if (maxBpm != null) _finishInlineValue('макс.', '$maxBpm'),
+        ],
+      ),
+    );
+  }
+
+  Widget _finishInlineValue(String label, String value) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            fontFamily: 'Montserrat',
+            color: Color(0xFF8A98A9),
+            fontSize: 8.5,
+          ),
+        ),
+        const SizedBox(width: 5),
+        Text(
+          value,
+          style: const TextStyle(
+            fontFamily: 'Montserrat',
+            color: Color(0xFFF5F7FA),
+            fontSize: 14,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _finishHeartRateZoneRow(int zone) {
+    final seconds = _heartRateZoneMilliseconds[zone - 1] ~/ 1000;
+    final totalSeconds = max(1, _heartRateCoveredMilliseconds ~/ 1000);
+    final fraction = (seconds / totalSeconds).clamp(0.0, 1.0).toDouble();
+    const colors = <Color>[
+      _klsIce,
+      _klsGreen,
+      _klsGold,
+      Color(0xFFFFA65C),
+      _klsRed,
+    ];
+    final color = colors[zone - 1];
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 7),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 25,
+            child: Text(
+              'Z$zone',
+              style: TextStyle(
+                fontFamily: 'Montserrat',
+                color: color,
+                fontSize: 9,
+                fontWeight: FontWeight.w500,
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: _finishMetric(
-                  'Макс. пульс',
-                  maxBpm != null ? '$maxBpm уд/мин' : '—',
-                  Icons.favorite_rounded,
-                ),
+            ),
+          ),
+          Expanded(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(99),
+              child: LinearProgressIndicator(
+                value: fraction,
+                minHeight: 6,
+                backgroundColor: Colors.white.withOpacity(0.06),
+                valueColor: AlwaysStoppedAnimation<Color>(color),
               ),
-            ],
+            ),
+          ),
+          const SizedBox(width: 9),
+          SizedBox(
+            width: 46,
+            child: Text(
+              _formatDuration(seconds),
+              textAlign: TextAlign.right,
+              style: TextStyle(
+                fontFamily: 'Montserrat',
+                color: Colors.white.withOpacity(0.66),
+                fontSize: 8.5,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
           ),
         ],
       ),
@@ -3811,7 +6031,8 @@ class _KlsGpsWorkoutRecorderWidgetState
     double speed,
   ) {
     final avgPaceText = '${_formatPaceFromSeconds(pace)} /км';
-    final avgSpeedText = '${speed.toStringAsFixed(1).replaceAll('.', ',')} км/ч';
+    final avgSpeedText =
+        '${speed.toStringAsFixed(1).replaceAll('.', ',')} км/ч';
     final maxSpeedText =
         '${(_maxSpeedMps * 3.6).toStringAsFixed(1).replaceAll('.', ',')} км/ч';
 
@@ -3989,29 +6210,30 @@ class _KlsGpsWorkoutRecorderWidgetState
 
   Widget _finishMetric(String label, String value, IconData icon) {
     return Container(
-      padding: const EdgeInsets.all(11),
-      decoration: BoxDecoration(
-        color: const Color(0xFF081B33),
-        borderRadius: BorderRadius.circular(16),
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      decoration: const BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: Color(0x10FFFFFF), width: 0.7),
+        ),
       ),
       child: Row(
         children: [
-          Icon(icon, color: _klsGold, size: 17),
+          Icon(icon, color: const Color(0xFF8A98A9), size: 14),
           const SizedBox(width: 8),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(label, style: _mutedTextStyle(8.5)),
+                Text(label, style: _mutedTextStyle(8.2)),
                 const SizedBox(height: 3),
                 Text(
                   value,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
+                    color: Color(0xFFF5F7FA),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
                     fontFamily: 'Montserrat',
                   ),
                 ),
@@ -4032,10 +6254,8 @@ class _KlsGpsWorkoutRecorderWidgetState
     String label,
     ValueChanged<double> onChanged,
   ) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.fromLTRB(13, 9, 13, 5),
-      decoration: _surfaceDecoration(radius: 17),
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
       child: Column(
         children: [
           Row(
@@ -4043,10 +6263,10 @@ class _KlsGpsWorkoutRecorderWidgetState
               Text(
                 title,
                 style: const TextStyle(
-                  color: Colors.white,
+                  color: Color(0xFFB5C0CC),
                   fontFamily: 'Montserrat',
-                  fontWeight: FontWeight.w600,
-                  fontSize: 11.5,
+                  fontWeight: FontWeight.w400,
+                  fontSize: 10.5,
                 ),
               ),
               const Spacer(),
@@ -4055,8 +6275,8 @@ class _KlsGpsWorkoutRecorderWidgetState
                 style: const TextStyle(
                   color: _klsGold,
                   fontFamily: 'Montserrat',
-                  fontWeight: FontWeight.w700,
-                  fontSize: 11.5,
+                  fontWeight: FontWeight.w500,
+                  fontSize: 10.5,
                 ),
               ),
             ],
@@ -4064,10 +6284,12 @@ class _KlsGpsWorkoutRecorderWidgetState
           SliderTheme(
             data: SliderTheme.of(context).copyWith(
               activeTrackColor: _klsGold,
-              inactiveTrackColor: Colors.white.withOpacity(0.1),
-              thumbColor: const Color(0xFFFFE3A7),
-              overlayColor: _klsGold.withOpacity(0.10),
-              trackHeight: 3,
+              inactiveTrackColor: const Color(0x18FFFFFF),
+              thumbColor: _klsGold,
+              overlayColor: _klsGold.withOpacity(0.08),
+              trackHeight: 2,
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
             ),
             child: Slider(
               value: value.clamp(min, max).toDouble(),
@@ -4080,6 +6302,55 @@ class _KlsGpsWorkoutRecorderWidgetState
         ],
       ),
     );
+  }
+}
+
+class _KlsGpsLongArrow extends StatelessWidget {
+  const _KlsGpsLongArrow({this.color = _klsGold});
+
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 28,
+      height: 14,
+      child: CustomPaint(painter: _KlsGpsLongArrowPainter(color)),
+    );
+  }
+}
+
+class _KlsGpsLongArrowPainter extends CustomPainter {
+  const _KlsGpsLongArrowPainter(this.color);
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.1
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    final y = size.height / 2;
+    canvas.drawLine(Offset(0, y), Offset(size.width - 1, y), paint);
+    canvas.drawLine(
+      Offset(size.width - 7, y - 4.5),
+      Offset(size.width - 1, y),
+      paint,
+    );
+    canvas.drawLine(
+      Offset(size.width - 7, y + 4.5),
+      Offset(size.width - 1, y),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _KlsGpsLongArrowPainter oldDelegate) {
+    return oldDelegate.color != color;
   }
 }
 
@@ -4181,7 +6452,7 @@ class _KlsRouteMap extends StatelessWidget {
                 child: _mapMarker(
                   Icons.flag_rounded,
                   _klsGold,
-                  const Color(0xFF08111F),
+                  const Color(0xFF061522),
                 ),
               ),
             if (showFinishMarker && all.length >= 2)
@@ -4192,7 +6463,7 @@ class _KlsRouteMap extends StatelessWidget {
                 child: _mapMarker(
                   Icons.sports_score_rounded,
                   Colors.white,
-                  const Color(0xFF08111F),
+                  const Color(0xFF061522),
                 ),
               ),
             if (!showFinishMarker && currentPoint != null)
@@ -4225,29 +6496,20 @@ class _KlsRouteMap extends StatelessWidget {
           ],
         ),
         RichAttributionWidget(
-          attributions: [
-            TextSourceAttribution('OpenStreetMap contributors'),
-          ],
+          attributions: [TextSourceAttribution('OpenStreetMap contributors')],
         ),
       ],
     );
   }
 
-  static Widget _mapMarker(
-    IconData icon,
-    Color background,
-    Color foreground,
-  ) {
+  static Widget _mapMarker(IconData icon, Color background, Color foreground) {
     return Container(
       decoration: BoxDecoration(
         color: background,
         shape: BoxShape.circle,
         border: Border.all(color: Colors.white, width: 2),
         boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.28),
-            blurRadius: 8,
-          ),
+          BoxShadow(color: Colors.black.withOpacity(0.28), blurRadius: 8),
         ],
       ),
       child: Icon(icon, color: foreground, size: 18),
@@ -4336,8 +6598,11 @@ class _KlsFullMapPage extends StatelessWidget {
                   height: 44,
                   decoration: BoxDecoration(
                     color: _klsNavy.withOpacity(0.9),
-                    borderRadius: BorderRadius.circular(15),
-                    border: Border.all(color: Colors.white.withOpacity(0.15)),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: const Color(0x22FFFFFF),
+                      width: 0.7,
+                    ),
                   ),
                   child: const Icon(Icons.close_rounded, color: Colors.white),
                 ),
@@ -4360,7 +6625,7 @@ class _KlsFullMapPage extends StatelessWidget {
                   style: TextStyle(
                     color: Colors.white,
                     fontFamily: 'Montserrat',
-                    fontWeight: FontWeight.w800,
+                    fontWeight: FontWeight.w500,
                   ),
                 ),
               ),
